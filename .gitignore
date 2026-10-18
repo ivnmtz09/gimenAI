@@ -1,0 +1,43 @@
+# Git ignore para GimenAI
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+.clang_complete
+.gcc-flags.json
+
+# Arduino
+*.hex
+*.bin
+*.elf
+
+# Python / Servidor
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+*.env
+.env.local
+
+# Claves y secretos
+credentials.h
+secrets.h
+api_key.txt
+*.key
+*.pem
+
+# VS Code / IDEs
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
