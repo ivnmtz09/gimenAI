@@ -17,7 +17,7 @@
 
 
 // ------------------------------------------------------------------------------
-// Clave API de Google Gemini (Obtenida gratis en https://aistudio.google.com/)
+// Clave API de Google Gemini (Opcional, el ESP32 usa el servidor Python)
 // ------------------------------------------------------------------------------
 #define GEMINI_API_KEY       "TU_GOOGLE_GEMINI_API_KEY"
 

@@ -31,50 +31,11 @@ except ImportError:
         legacy_genai.configure(api_key=API_KEY)
 
 # ==============================================================================
-# Registro de Dispositivos Inteligentes del Hogar
+# Registro Dinámico de Dispositivos Inteligentes del Hogar
 # ==============================================================================
-smart_devices: Dict[str, Dict[str, Any]] = {
-    "luz_sala": {
-        "id": "luz_sala",
-        "name": "Bombillo de la Sala",
-        "type": "light",
-        "target": "esp32",
-        "state": False,
-        "pin": 2,
-        "ip": None,
-        "description": "LED azul integrado en la placa ESP32 DevKit V1"
-    },
-    "luz_cocina": {
-        "id": "luz_cocina",
-        "name": "Bombillo de la Cocina",
-        "type": "light",
-        "target": "virtual",
-        "state": False,
-        "pin": 4,
-        "ip": None,
-        "description": "Bombillo inteligente virtual (o GPIO 4)"
-    },
-    "luz_habitacion": {
-        "id": "luz_habitacion",
-        "name": "Luz de la Habitación",
-        "type": "light",
-        "target": "virtual",
-        "state": False,
-        "pin": 16,
-        "ip": None,
-        "description": "Luz inteligente de dormitorio"
-    },
-    "ventilador": {
-        "id": "ventilador",
-        "name": "Ventilador de Techo",
-        "type": "fan",
-        "target": "virtual",
-        "state": False,
-        "pin": 5,
-        "ip": None,
-        "description": "Ventilador / Enchufe inteligente"
-    }
-}
+# Inicia vacío: Solo se agregan dispositivos reales cuando el ESP32 se conecta
+# o cuando el escáner de red detecta equipos en tu WiFi.
+smart_devices: Dict[str, Dict[str, Any]] = {}
 
 # Nodos ESP32 conectados en la red
 esp32_nodes: Dict[str, Dict[str, Any]] = {}
@@ -91,10 +52,13 @@ conversation_memory: List[Dict[str, str]] = []
 def get_system_prompt() -> str:
     # Resumen de dispositivos disponibles
     devices_lines = []
-    for d_id, d in smart_devices.items():
-        st = "ENCENDIDO" if d["state"] else "APAGADO"
-        ip_info = f" (IP: {d['ip']})" if d.get("ip") else ""
-        devices_lines.append(f"- '{d_id}': {d['name']} [{st}] - {d['description']}{ip_info}")
+    if smart_devices:
+        for d_id, d in smart_devices.items():
+            st = "ENCENDIDO" if d["state"] else "APAGADO"
+            ip_info = f" (IP: {d['ip']})" if d.get("ip") else ""
+            devices_lines.append(f"- '{d_id}': {d['name']} [{st}] - {d['description']}{ip_info}")
+    else:
+        devices_lines.append("- En este momento NO hay ningún dispositivo registrado ni conectado.")
 
     devices_str = "\n".join(devices_lines)
 
@@ -102,9 +66,9 @@ def get_system_prompt() -> str:
     esp_lines = []
     if esp32_nodes:
         for node_id, node in esp32_nodes.items():
-            esp_lines.append(f"- Nodo ESP32 '{node_id}' en IP {node.get('ip')} (Última señal: {node.get('last_seen')}s)")
+            esp_lines.append(f"- Nodo ESP32 '{node_id}' en IP {node.get('ip')}")
     else:
-        esp_lines.append("- Ningún ESP32 ha enviado anuncio todavía (los controles son simulados hasta que se conecte).")
+        esp_lines.append("- Ningún ESP32 conectado todavía. Esperando que el ESP32 encienda y se conecte a la red WiFi.")
 
     esp_str = "\n".join(esp_lines)
 
@@ -340,10 +304,19 @@ def register_esp32_node(req: ESP32RegisterRequest):
         "capabilities": req.capabilities,
         "last_seen": int(time.time())
     }
-    # Asignar IP al bombillo de la sala
-    if "luz_sala" in req.capabilities and "luz_sala" in smart_devices:
-        smart_devices["luz_sala"]["ip"] = req.ip
-        smart_devices["luz_sala"]["target"] = "esp32_hardware"
+    
+    # Agregar dinámicamente el bombillo físico del ESP32 al registro de dispositivos
+    if "luz_sala" in req.capabilities:
+        smart_devices["luz_sala"] = {
+            "id": "luz_sala",
+            "name": "LED Azul Placa (Bombillo Sala)",
+            "type": "light",
+            "target": "esp32_hardware",
+            "state": False,
+            "pin": 2,
+            "ip": req.ip,
+            "description": f"LED integrado en ESP32 DevKit (GPIO 2) en {req.ip}"
+        }
 
     print(f"\n🎉 [NUEVO DISPOSITIVO HARDWARE DETECTADO]: {req.name} ({req.id}) en IP {req.ip}")
     print(f"   Capacidades registradas: {req.capabilities}\n")
@@ -533,6 +506,11 @@ def get_web_ui():
         function renderDashboard(devices) {
             const container = document.getElementById('devices-dashboard');
             container.innerHTML = '';
+            const keys = Object.keys(devices);
+            if (keys.length === 0) {
+                container.innerHTML = '<div style="grid-column: 1 / -1; color: #94a3b8; font-size: 0.88rem; padding: 6px 0;">ℹ️ <b>Sin dispositivos activos en este momento.</b> Conecta tu ESP32 a la WiFi para que se registre automáticamente su LED integrado, o pulsa "🔍 Escanear Red".</div>';
+                return;
+            }
             for (const [key, dev] of Object.entries(devices)) {
                 const card = document.createElement('div');
                 card.className = 'device-card';
