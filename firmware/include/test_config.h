@@ -6,23 +6,32 @@
 // ==============================================================================
 
 // ------------------------------------------------------------------------------
-// Configuración de Red WiFi y Servidor Local GimenAI
+// Configuración de Red WiFi
 // ------------------------------------------------------------------------------
+// Configuración local opcional (secrets.h está excluido de Git).
+#if __has_include("secrets.h")
+#include "secrets.h"
+#endif
+
+#ifndef TEST_WIFI_SSID
 #define TEST_WIFI_SSID       "A54"
+#endif
+#ifndef TEST_WIFI_PASSWORD
 #define TEST_WIFI_PASSWORD   "12345678"
-
-// IP de la computadora donde corre 'python3 main.py' (tu IP actual detectada: 10.82.50.223)
-#define SERVER_HOST          "10.82.50.223"
-#define SERVER_PORT          8000
-
+#endif
 
 // ------------------------------------------------------------------------------
-// Clave API de Google Gemini (Opcional, el ESP32 usa el servidor Python)
+// Gemini directo desde el ESP32. Define la clave real en secrets.h.
 // ------------------------------------------------------------------------------
+#ifndef GEMINI_API_KEY
 #define GEMINI_API_KEY       "TU_GOOGLE_GEMINI_API_KEY"
+#endif
 
-// Modelo a usar (gemini-1.5-flash es rápido, económico y excelente para IoT)
-#define GEMINI_MODEL         "gemini-1.5-flash"
+#ifndef GEMINI_MODEL
+#define GEMINI_MODEL         "gemini-3.5-flash-lite"
+#endif
+#define GEMINI_TTS_MODEL     "gemini-2.5-flash-preview-tts"
+#define GEMINI_TTS_VOICE     "Kore"
 
 // ------------------------------------------------------------------------------
 // Pantalla OLED GM009605v4.3 (Controlador SSD1306 I2C 128x64)
@@ -45,3 +54,19 @@
 
 // Dispositivo 3: Enchufe / Ventilador / Relé
 #define PIN_DEVICE_VENTILADOR   5   
+
+// ------------------------------------------------------------------------------
+// Parlante: amplificador I2S MAX98357A (voz de Gimena)
+// ------------------------------------------------------------------------------
+#define AUDIO_PIN_BCLK       26   // MAX98357A BCLK
+#define AUDIO_PIN_LRC        25   // MAX98357A LRC (WS)
+#define AUDIO_PIN_DIN        27   // MAX98357A DIN
+#define AUDIO_SAMPLE_RATE    16000  // salida I2S; Gemini TTS se remuestrea desde 24 kHz
+#define AUDIO_VOLUMEN        60   // 0-100 (si suena saturado o con ruido, bájalo)
+
+// ------------------------------------------------------------------------------
+// Bluetooth: el ESP32 busca parlantes/audífonos (A2DP) y les envía la voz de Gimena
+// ------------------------------------------------------------------------------
+// 1 = diagnóstico: el selector lista TODO dispositivo Bluetooth visible (teléfonos, PCs...)
+// 0 = solo dispositivos de audio y teléfonos (lo normal)
+#define BT_LISTAR_TODOS      0

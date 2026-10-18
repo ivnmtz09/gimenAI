@@ -3,9 +3,14 @@ import json
 import time
 import asyncio
 import socket
+import io
+import re
+import wave
+import hashlib
+import logging
 from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -94,13 +99,26 @@ RED LOCAL:
 FORMATO OBLIGATORIO DE RESPUESTA (JSON ESTRICTO):
 {{
   "reply": "Texto de la respuesta en español para el usuario",
-  "face": "neutral",
+  "face": "una de: neutral, happy, love, surprised, sad, thinking, sleepy",
   "device_actions": [
      {{ "device": "id_del_dispositivo", "state": true/false }}
   ]
 }}
 Si no modificas dispositivos, "device_actions" debe ser [].
+
+El campo "face" es la expresion que mostrara la pantalla del robot mientras responde. Elige la que mejor refleje la emocion de TU respuesta:
+- happy: saludos, buenas noticias, celebraciones, confirmar que hiciste algo, chistes.
+- love: agradecimientos, cariño, halagos, afecto.
+- surprised: noticias inesperadas, sorpresa, asombro.
+- sad: lamentos, malas noticias, tristeza del usuario, disculpas, no poder hacer algo.
+- thinking: dudas, explicaciones o razonamientos largos, no estar segura.
+- sleepy: despedidas, buenas noches, cansancio.
+- neutral: informacion factual sin carga emocional.
+Evita usar siempre neutral: usa la expresion que corresponda.
 """
+
+# Expresiones que sabe dibujar la pantalla OLED del ESP32
+VALID_FACES = {"neutral", "happy", "love", "surprised", "sad", "thinking", "sleepy"}
 
 app = FastAPI(
     title="GimenAI IoT Gateway",
@@ -118,6 +136,7 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str
+    source: Optional[str] = None   # "esp32" si la consulta viene del propio robot
 
 class ESP32RegisterRequest(BaseModel):
     id: str
@@ -212,6 +231,136 @@ async def notify_esp32_physical(device_id: str, new_state: bool):
             print(f"[HARDWARE ESP32] No se pudo enviar orden al ESP32 en {esp_ip}: {err}")
 
 # ==============================================================================
+# Voz (Text-to-Speech): edge-tts -> WAV 16 kHz mono 16 bit para el parlante del ESP32
+# ==============================================================================
+TTS_ENABLED = os.getenv("TTS_ENABLED", "1") != "0"
+TTS_VOICE = os.getenv("TTS_VOICE", "es-CO-SalomeNeural")   # voz femenina colombiana
+TTS_RATE = os.getenv("TTS_RATE", "+5%")
+TTS_PITCH = os.getenv("TTS_PITCH", "+8Hz")                 # un poco aguda: voz tierna
+TTS_SAMPLE_RATE = 16000
+
+tts_texts: Dict[str, str] = {}      # audio_id -> texto a pronunciar
+tts_wav_cache: Dict[str, bytes] = {}  # audio_id -> WAV ya sintetizado
+
+
+def clean_text_for_speech(text: str) -> str:
+    """Quita emojis y marcas de formato que sonarian raro al leerse en voz alta."""
+    text = re.sub("[🀀-🿿☀-➿️]", "", text)
+    text = re.sub(r"[*_`#~>|\[\]{}<]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def register_tts(text: str) -> Optional[str]:
+    """Reserva un id de audio para el texto; la sintesis ocurre cuando el ESP32 lo pide."""
+    if not TTS_ENABLED:
+        return None
+    clean = clean_text_for_speech(text)
+    if not clean:
+        return None
+    audio_id = hashlib.sha1(f"{TTS_VOICE}|{clean}".encode("utf-8")).hexdigest()[:16]
+    tts_texts[audio_id] = clean
+    while len(tts_texts) > 40:   # memoria acotada
+        old = next(iter(tts_texts))
+        tts_texts.pop(old, None)
+        for key in [k for k in tts_wav_cache if k.startswith(old + ":")]:
+            tts_wav_cache.pop(key, None)
+    return audio_id
+
+
+async def synthesize_wav(audio_id: str, rate: int = TTS_SAMPLE_RATE) -> bytes:
+    cache_key = f"{audio_id}:{rate}"
+    if cache_key in tts_wav_cache:
+        return tts_wav_cache[cache_key]
+
+    import edge_tts
+    import miniaudio
+
+    communicate = edge_tts.Communicate(tts_texts[audio_id], TTS_VOICE, rate=TTS_RATE, pitch=TTS_PITCH)
+    mp3 = b""
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            mp3 += chunk["data"]
+    if not mp3:
+        raise RuntimeError("edge-tts no devolvio audio")
+
+    decoded = miniaudio.decode(
+        mp3,
+        output_format=miniaudio.SampleFormat.SIGNED16,
+        nchannels=1,
+        sample_rate=rate,
+    )
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(decoded.samples.tobytes())
+    wav = buf.getvalue()
+    tts_wav_cache[cache_key] = wav
+    return wav
+
+
+async def notify_esp32_speak(text: str, face: str, audio_url: Optional[str]):
+    """Cuando la consulta no viene del ESP32 (p. ej. del panel web), le pide que la diga en voz alta."""
+    if not esp32_nodes:
+        return
+    esp_ip = next(iter(esp32_nodes.values())).get("ip")
+    if not esp_ip:
+        return
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as http_client:
+            await http_client.post(f"http://{esp_ip}/api/speak", json={"url": audio_url or "", "face": face, "text": text})
+            print(f"[HARDWARE ESP32] Voz enviada a {esp_ip}")
+    except Exception as err:
+        print(f"[HARDWARE ESP32] No se pudo enviar la voz al ESP32 en {esp_ip}: {err}")
+
+# ==============================================================================
+# Bluetooth (A2DP): el ESP32 busca y se conecta a un parlante; el servidor hace de puente
+# ==============================================================================
+BT_ADDRESS_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+
+
+class BluetoothConnectRequest(BaseModel):
+    address: str
+
+
+async def esp32_request(method: str, path: str, payload: Optional[dict] = None, timeout: float = 5.0):
+    """Llama a la API local del primer ESP32 registrado. Devuelve el JSON o None si falla."""
+    if not esp32_nodes:
+        return None
+    esp_ip = next(iter(esp32_nodes.values())).get("ip")
+    if not esp_ip:
+        return None
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as http_client:
+            resp = await http_client.request(method, f"http://{esp_ip}{path}", json=payload)
+            if resp.status_code == 404:
+                raise HTTPException(status_code=502, detail="El firmware del ESP32 no incluye Bluetooth. Actualiza el firmware esp32-test-devkit.")
+            if not resp.is_success:
+                try:
+                    detail = resp.json().get("error") or "El ESP32 rechazo la solicitud Bluetooth"
+                except (ValueError, AttributeError):
+                    detail = "El ESP32 rechazo la solicitud Bluetooth"
+                raise HTTPException(status_code=resp.status_code if 400 <= resp.status_code < 500 else 502, detail=detail)
+            data = resp.json()
+            if not isinstance(data, dict) or not isinstance(data.get("dispositivos"), list):
+                raise HTTPException(status_code=502, detail="El ESP32 devolvio un estado Bluetooth invalido. Actualiza su firmware.")
+            return {**bluetooth_unavailable(), **data, "esp32": True, "error": data.get("error", "")}
+    except HTTPException:
+        raise
+    except Exception as err:
+        logging.getLogger(__name__).warning("[HARDWARE ESP32] %s %s fallo en %s: %s", method, path, esp_ip, err)
+        return None
+
+
+def bluetooth_unavailable() -> Dict[str, Any]:
+    return {"esp32": False, "activo": False, "escaneando": False, "conectado": False,
+            "dispositivos": [], "error": "ESP32 no disponible"}
+
+
+# ==============================================================================
 # Endpoints de API y Chat
 # ==============================================================================
 
@@ -223,6 +372,8 @@ async def chat_endpoint(req: ChatRequest):
     result = generate_chat_response(user_msg)
     reply_text = result.get("reply", "Entendido.")
     face = result.get("face", "neutral")
+    if face not in VALID_FACES:
+        face = "neutral"
     actions = result.get("device_actions", [])
 
     for action in actions:
@@ -235,13 +386,67 @@ async def chat_endpoint(req: ChatRequest):
 
     devices_summary = {k: v["state"] for k, v in smart_devices.items()}
 
+    audio_id = register_tts(reply_text)
+    audio_url = f"/api/audio/{audio_id}.wav" if audio_id else None
+    if req.source != "esp32":
+        asyncio.create_task(notify_esp32_speak(reply_text, face, audio_url))
+
     return {
         "reply": reply_text,
         "face": face,
+        "audio_url": audio_url,
         "devices": devices_summary,
         "raw_devices": smart_devices,
         "connected_nodes": list(esp32_nodes.values())
     }
+
+@app.get("/api/audio/{audio_id}.wav")
+async def get_audio(audio_id: str, rate: int = TTS_SAMPLE_RATE):
+    """WAV mono 16 bit con la voz de Gimena (16 kHz por defecto; ?rate=44100 para parlantes Bluetooth)."""
+    if audio_id not in tts_texts:
+        raise HTTPException(status_code=404, detail="Audio no encontrado")
+    if rate not in (16000, 22050, 44100):
+        raise HTTPException(status_code=400, detail="Frecuencia no soportada")
+    try:
+        wav = await synthesize_wav(audio_id, rate)
+    except Exception as err:
+        print(f"[TTS] Error sintetizando voz: {err}")
+        raise HTTPException(status_code=503, detail="No se pudo generar la voz")
+    return Response(content=wav, media_type="audio/wav")
+
+@app.get("/api/bluetooth")
+async def bluetooth_status():
+    """Estado del Bluetooth del ESP32 y lista de parlantes encontrados."""
+    data = await esp32_request("GET", "/api/bt")
+    if data is None:
+        return bluetooth_unavailable()
+    data["esp32"] = True
+    return data
+
+@app.post("/api/bluetooth/scan")
+async def bluetooth_scan():
+    """Pide al ESP32 que busque dispositivos Bluetooth cercanos."""
+    data = await esp32_request("POST", "/api/bt/scan", {}, timeout=12.0)
+    if data is None:
+        return bluetooth_unavailable()
+    return data
+
+@app.post("/api/bluetooth/connect")
+async def bluetooth_connect(req: BluetoothConnectRequest):
+    """Conecta el ESP32 al dispositivo Bluetooth elegido en el selector."""
+    if not BT_ADDRESS_RE.fullmatch(req.address):
+        raise HTTPException(status_code=400, detail="Direccion Bluetooth invalida")
+    data = await esp32_request("POST", "/api/bt/connect", {"address": req.address.upper()}, timeout=12.0)
+    if data is None:
+        return bluetooth_unavailable()
+    return data
+
+@app.post("/api/bluetooth/disconnect")
+async def bluetooth_disconnect():
+    data = await esp32_request("POST", "/api/bt/disconnect", {}, timeout=8.0)
+    if data is None:
+        return bluetooth_unavailable()
+    return data
 
 @app.get("/api/chat/history")
 def get_chat_history():
@@ -631,6 +836,58 @@ def get_web_ui():
             background: var(--primary-hover);
         }
 
+        /* Bluetooth: selector de parlantes encontrados por el ESP32 */
+        #bluetooth-section {
+            background: #0d1322;
+            border-bottom: 1px solid var(--surface-border);
+            padding: 12px 20px;
+            flex-shrink: 0;
+        }
+
+        .bt-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .bt-select {
+            flex: 1;
+            min-width: 180px;
+            background: var(--bg);
+            color: var(--text-primary);
+            border: 1px solid var(--surface-border);
+            border-radius: 4px;
+            padding: 8px 10px;
+            font-size: 0.85rem;
+            outline: none;
+        }
+
+        .bt-select:focus {
+            border-color: var(--primary);
+        }
+
+        .bt-status {
+            font-size: 0.74rem;
+            color: var(--text-muted);
+            margin-top: 8px;
+            min-height: 1em;
+        }
+
+        .bt-status.ok { color: #34d399; }
+        .bt-status.error { color: #f87171; }
+
+        .btn-action.primary {
+            background: var(--primary);
+            border-color: var(--primary);
+            color: #ffffff;
+        }
+
+        .btn-action:disabled {
+            opacity: 0.45;
+            cursor: default;
+        }
+
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(4px); }
             to { opacity: 1; transform: translateY(0); }
@@ -698,6 +955,22 @@ def get_web_ui():
             <span id="devices-count">0</span>
         </div>
         <div class="devices-grid" id="devices-dashboard"></div>
+    </section>
+
+    <section id="bluetooth-section">
+        <div class="section-header">
+            <span>Bluetooth</span>
+            <span id="bt-state">Sin conexion</span>
+        </div>
+        <div class="bt-row">
+            <select class="bt-select" id="bt-select" aria-label="Dispositivos Bluetooth disponibles" aria-describedby="bt-status" disabled>
+                <option value="">Comprobando Bluetooth...</option>
+            </select>
+            <button class="btn-action" id="bt-scan-btn" onclick="btScan()" disabled>Buscar</button>
+            <button class="btn-action primary" id="bt-connect-btn" onclick="btToggleConnection()" disabled>Conectar</button>
+        </div>
+        <div class="bt-status" id="bt-status" role="status" aria-live="polite"></div>
+        <div class="bt-status">El ESP32 busca parlantes y audífonos Bluetooth cercanos. Activa el modo emparejamiento del dispositivo.</div>
     </section>
 
     <div class="chat-area" id="chat">
@@ -832,8 +1105,146 @@ def get_web_ui():
             chatDiv.scrollTop = chatDiv.scrollHeight;
         }
 
+        // ---------------- Bluetooth ----------------
+        const btSelect = document.getElementById('bt-select');
+        const btState = document.getElementById('bt-state');
+        const btStatus = document.getElementById('bt-status');
+        const btScanBtn = document.getElementById('bt-scan-btn');
+        const btConnectBtn = document.getElementById('bt-connect-btn');
+        let btData = { esp32: false, conectado: false, escaneando: false, dispositivos: [] };
+        let btBusy = false;
+        let btPolling = false;
+        let btRevision = 0;
+        let btCommandError = '';
+
+        async function btRequest(path, options = {}) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 15000);
+            try {
+                const res = await fetch(path, { ...options, signal: controller.signal, cache: 'no-store' });
+                let data;
+                try { data = await res.json(); }
+                catch (_) { throw new Error('El servidor devolvió una respuesta Bluetooth inválida'); }
+                if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : (data.error || 'No se pudo completar la solicitud Bluetooth'));
+                if (!data || typeof data.esp32 !== 'boolean' || !Array.isArray(data.dispositivos)) {
+                    throw new Error('El servidor devolvió un estado Bluetooth inválido');
+                }
+                return data;
+            } catch (e) {
+                if (e.name === 'AbortError') throw new Error('El ESP32 tardó demasiado en responder. Vuelve a intentarlo.');
+                throw e;
+            } finally { clearTimeout(timer); }
+        }
+
+        async function fetchBluetooth() {
+            if (btPolling || btBusy) return;
+            const revision = btRevision;
+            btPolling = true;
+            try {
+                const data = await btRequest('/api/bluetooth');
+                if (revision === btRevision) btData = data;
+            } catch (e) {
+                if (revision === btRevision) {
+                    btData = { esp32: false, conectado: false, escaneando: false, dispositivos: [], error: e.message };
+                }
+            } finally {
+                btPolling = false;
+                renderBluetooth();
+            }
+        }
+
+        function btSetOptions(devs) {
+            const previo = btSelect.value;
+            // Actualizar las opciones existentes conserva la selección durante el sondeo.
+            const addresses = new Set(devs.map(d => d.direccion));
+            for (const opt of Array.from(btSelect.options)) {
+                if (!addresses.has(opt.value)) opt.remove();
+            }
+            if (devs.length === 0) {
+                const opt = document.createElement('option');
+                opt.value = '';
+                opt.textContent = !btData.esp32 ? 'ESP32 no disponible' : (btData.escaneando ? 'Buscando dispositivos...' : 'Sin dispositivos: pulsa Buscar');
+                btSelect.appendChild(opt);
+                return;
+            }
+            for (const d of devs) {
+                let opt = Array.from(btSelect.options).find(o => o.value === d.direccion);
+                if (!opt) {
+                    opt = document.createElement('option');
+                    opt.value = d.direccion;
+                    btSelect.appendChild(opt);
+                }
+                const nombre = d.nombre && d.nombre.length ? d.nombre : d.direccion;
+                const signal = Number.isFinite(d.rssi) && d.rssi < 0 ? ' · ' + d.rssi + ' dBm' : '';
+                const label = nombre + ' (' + d.direccion + ')' + (d.conectado ? ' · conectado' : '') + signal;
+                if (opt.textContent !== label) opt.textContent = label;
+            }
+            const conectado = devs.find(d => d.conectado);
+            if (devs.some(d => d.direccion === previo)) btSelect.value = previo;
+            else if (conectado) btSelect.value = conectado.direccion;
+        }
+
+        function renderBluetooth() {
+            const d = btData;
+            const devs = (d.dispositivos || []).slice().sort((a, b) => (a.nombre || a.direccion).localeCompare(b.nombre || b.direccion));
+            btSetOptions(devs);
+
+            let estado = 'Sin conexion', clase = '';
+            if (btCommandError) { estado = btCommandError; clase = 'error'; }
+            else if (!d.esp32) { estado = d.error || 'ESP32 no disponible'; clase = 'error'; }
+            else if (d.error) { estado = d.error; clase = 'error'; }
+            else if (d.conectado) { estado = 'Conectado a ' + (d.nombre || d.direccion); clase = 'ok'; }
+            else if (d.objetivo) { estado = 'Conectando a ' + d.objetivo + '...'; }
+            else if (d.escaneando) { estado = 'Buscando dispositivos cercanos...'; }
+            else if (devs.length) { estado = 'Elige un dispositivo y pulsa Conectar'; }
+            else { estado = 'Pulsa Buscar. El parlante debe estar encendido en modo emparejamiento.'; }
+
+            const conectando = !!d.objetivo && !d.conectado;
+            btState.textContent = d.conectado ? 'Conectado' : (conectando ? 'Conectando' : (d.escaneando ? 'Buscando' : 'Sin conexion'));
+            btStatus.textContent = estado;
+            btStatus.className = 'bt-status ' + clase;
+
+            btSelect.disabled = btBusy || !d.esp32 || d.conectado || conectando || !devs.length;
+            btScanBtn.disabled = btBusy || !d.esp32 || d.conectado || d.escaneando || conectando;
+            btScanBtn.textContent = d.escaneando ? 'Buscando...' : 'Buscar';
+            btConnectBtn.textContent = d.conectado ? 'Desconectar' : (conectando ? 'Cancelar conexión' : 'Conectar');
+            btConnectBtn.disabled = btBusy || !d.esp32 || (!d.conectado && !conectando && !btSelect.value);
+        }
+
+        async function btCommand(path, payload) {
+            if (btBusy) return;
+            btRevision++;
+            btCommandError = '';
+            btBusy = true; renderBluetooth();
+            try {
+                const options = { method: 'POST' };
+                if (payload) {
+                    options.headers = { 'Content-Type': 'application/json' };
+                    options.body = JSON.stringify(payload);
+                }
+                btData = await btRequest(path, options);
+            } catch (e) { btCommandError = e.message; }
+            finally { btBusy = false; renderBluetooth(); }
+        }
+
+        async function btScan() {
+            await btCommand('/api/bluetooth/scan');
+        }
+
+        async function btToggleConnection() {
+            if (btData.conectado || btData.objetivo) {
+                await btCommand('/api/bluetooth/disconnect');
+            } else if (btSelect.value) {
+                await btCommand('/api/bluetooth/connect', { address: btSelect.value });
+            }
+        }
+
+        btSelect.addEventListener('change', renderBluetooth);
+
         fetchDevices();
         setInterval(fetchDevices, 4000);
+        fetchBluetooth();
+        setInterval(fetchBluetooth, 2000);
     </script>
 </body>
 </html>

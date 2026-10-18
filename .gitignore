@@ -41,3 +41,6 @@ api_key.txt
 # Sistema operativo
 .DS_Store
 Thumbs.db
+
+# Logs del lanzador/servidor
+server/*.log

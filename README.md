@@ -1,5 +1,30 @@
 # GimenAI - Asistente de IA Robótico para el Hogar 🤖✨
 
+## Modo actual: ESP32 autónomo (DevKit V1)
+
+El entorno predeterminado `esp32-test-devkit` sirve el panel web y controla
+Bluetooth, salidas GPIO y pantalla desde la propia placa. Consulta Gemini por
+HTTPS y reproduce su voz por I2S o Bluetooth A2DP. **No necesita Python ni un
+servidor en el PC**; sí necesita WiFi con Internet para Gemini y la voz.
+
+1. Crea `firmware/include/secrets.h` (excluido de Git) con `#define TEST_WIFI_SSID`,
+   `#define TEST_WIFI_PASSWORD` y `#define GEMINI_API_KEY`, cada valor entre comillas.
+2. Compila y carga `esp32-test-devkit` desde `firmware/` con PlatformIO.
+3. Abre `http://<IP-del-ESP32>/` en un celular o computador en la misma red.
+   La dirección aparece en el monitor serie a 115200 baudios.
+4. En Bluetooth, pulsa **Buscar**, elige un parlante en modo emparejamiento y
+   pulsa **Conectar**. Escribe al asistente desde ese mismo panel.
+
+Gemini y la síntesis de voz siguen ejecutándose en los servicios de Google;
+la placa gestiona las solicitudes directamente. El historial conserva las tres
+últimas interacciones en RAM y se borra al reiniciar o limpiar el chat. La voz usa
+la cuota de Gemini TTS de la cuenta; un error de voz no descarta la respuesta escrita.
+
+`server/` conserva la pasarela anterior para otras pruebas. No es parte del
+arranque del modo autónomo. Las instrucciones de Python y del ESP32-S3 que
+aparecen más abajo corresponden a esa arquitectura anterior y a la fase final.
+
+
 **Proyecto de la Asignatura de Internet de las Cosas (IoT)**  
 **Ingeniería de Sistemas — Universidad de La Guajira**  
 **Entrega:** Fase 1 (Definición del problema, arquitectura, esquemáticos y estructura base)

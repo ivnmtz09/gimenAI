@@ -66,3 +66,67 @@ En los módulos ESP32-S3 con PSRAM Octal (variante `N8R8` o `N16R8`), los **GPIO
 ### Reglas Esenciales de Electricidad:
 1. **Separación de Potencia de Servos**: Los servomotores generan picos inductivos bruscos al arrancar que pueden hacer caer el voltaje del ESP32-S3 y provocar reinicios espontáneos (*Brownout Reset*). Usa un capacitor electrolítico de **470 µF a 1000 µF (16V)** en paralelo con las líneas de alimentación de los servomotores.
 2. **Tierra Común Obligatoria**: Conecta todos los terminales de GND entre sí (Fuente 5V, ESP32, Pantalla, Micrófono, Amplificador y Servos). Si no comparten tierra, la señal PWM y los buses I2S tendrán ruido incontrolable.
+
+---
+
+## Entorno de pruebas: ESP32 DevKit V1 + OLED + parlante
+
+Conexiones del firmware `esp32-test-devkit` (`firmware/src/test_mode`):
+
+| Módulo | Señal | Pin ESP32 DevKit V1 | Notas |
+| :--- | :--- | :--- | :--- |
+| **OLED SSD1306** | SDA / SCL | **GPIO 21 / 22** | I2C, dirección 0x3C, VCC a 3V3 |
+| **MAX98357A** (parlante) | BCLK | **GPIO 26** | I2S |
+| | LRC (WS) | **GPIO 25** | I2S |
+| | DIN | **GPIO 27** | I2S |
+| | VIN / GND | **5V (pin VIN) / GND** | El pin VIN del DevKit entrega 5 V por USB |
+| | SD | 3V3 (o sin conectar) | Amplificador activo (mezcla L+R) |
+| | GAIN | sin conectar (9 dB) o GND (12 dB) | |
+| **Parlante** | + / − | Salidas del MAX98357A | 4–8 Ω, 3 W máx. |
+
+Al arrancar suenan dos notas cortas: si las oyes, el cableado del parlante es correcto.
+El volumen se ajusta con `AUDIO_VOLUMEN` en `firmware/include/test_config.h`.
+
+**Flujo autónomo:** el ESP32 sirve el panel en el puerto 80 y llama directamente
+por HTTPS a Gemini para obtener la respuesta y las acciones GPIO. Después consulta
+Gemini TTS y decodifica el audio PCM de 24 kHz por bloques, sin almacenarlo completo
+en RAM. Remuestrea a 16 kHz para I2S o 44,1 kHz para A2DP. El PC puede estar apagado.
+Se valida el certificado TLS con el almacén de autoridades de confianza del SDK
+ESP32; la hora se sincroniza por NTP. Mantén actualizada la plataforma para
+actualizar ese almacén de certificados. La voz depende de la cuota de Gemini TTS de la cuenta.
+
+### Selector Bluetooth del panel web
+
+En el entorno `esp32-test-devkit`, la voz también puede salir por un parlante o
+audífonos Bluetooth Classic con perfil A2DP, sin conectar el MAX98357A.
+El ESP32 realiza el escaneo y aloja el panel; el navegador se conecta directamente a la placa.
+
+1. Compila y carga el entorno `esp32-test-devkit` de `firmware/platformio.ini`.
+   La librería ESP32-A2DP se instala automáticamente. La partición `huge_app.csv`
+   deja espacio para WiFi, Bluetooth y el panel local; este entorno no usa OTA.
+2. Conecta el ESP32 y el celular o computador a la misma red WiFi. Abre
+   `http://<IP-del-ESP32>/` (la IP aparece en el monitor serie). No ejecutes Python.
+   Configura `firmware/include/secrets.h` (ignorado por Git) con `TEST_WIFI_SSID`,
+   `TEST_WIFI_PASSWORD` y `GEMINI_API_KEY`, definidos con `#define` y valores entre
+   comillas. Esta configuración tiene prioridad sobre `test_config.h`.
+3. Enciende el parlante y activa su modo de emparejamiento. En **Bluetooth** pulsa
+   **Buscar**: el selector se actualiza mientras el ESP32 escanea durante 45 segundos.
+4. Elige el nombre y dirección del dispositivo y pulsa **Conectar**. El panel muestra
+   el progreso y permite **Cancelar conexión**. La conexión puede tardar hasta 60 segundos.
+5. Cuando aparezca **Conectado**, escribe al asistente: su voz saldrá por el parlante.
+   Usa **Desconectar** antes de elegir otro. El ESP32 recuerda el último parlante
+   y trata de reconectarlo al arrancar; una desconexión voluntaria borra ese recuerdo.
+
+El selector muestra dispositivos de audio Bluetooth Classic detectables por el ESP32;
+no es una lista de sensores BLE ni de dispositivos detectados por el computador.
+Si no aparece un parlante, comprueba que no esté conectado a otro teléfono o PC y
+vuelve a activar el emparejamiento. Un error de firmware en el panel requiere
+volver a cargar `esp32-test-devkit`.
+
+El ESP32-S3 del entorno final solo admite Bluetooth LE, por lo que no puede usar
+A2DP directamente ([compatibilidad de Espressif](https://docs.espressif.com/projects/esp-adf/en/latest/solution-center/bluetooth-audio.html)).
+
+La placa expone `/api/devices`, `/api/chat`, `/api/chat/status` y
+`/api/bluetooth` con sus acciones de búsqueda, conexión y desconexión. El chat
+se acepta como trabajo (HTTP 202) y el panel consulta su estado; la clave API
+nunca se incluye en las respuestas HTTP ni en el HTML.
