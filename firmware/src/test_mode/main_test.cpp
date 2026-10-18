@@ -208,8 +208,16 @@ void dibujarCara(const String& cara, bool parpadeo) {
     }
 }
 
+bool portalWiFiActivo = false;   // sin red: la OLED muestra el QR del portal WiFi
+void dibujarPantallaSinWiFi();
+
 void dibujarPantalla() {
     display.clearDisplay();
+    if (portalWiFiActivo) {
+        dibujarPantallaSinWiFi();
+        display.display();
+        return;
+    }
     dibujarCara(oledCara, oledParpadeo);
 
     // Único indicador: circulito vacío arriba a la izquierda si no hay WiFi
@@ -232,6 +240,7 @@ void renderOLED(const String& cara, const String& mensaje, bool hablar = false) 
 
 // Animaciones no bloqueantes: pestañeo, boca hablando, burbujas, latido y lágrima
 void actualizarPantalla() {
+    if (portalWiFiActivo) return;   // QR fijo: no redibujar mientras se escanea
     unsigned long ahora = millis();
     bool redibujar = false;
 
@@ -765,6 +774,7 @@ void handleBtDesconectar() {
 }
 
 #include "standalone_routes.h"
+#include "wifi_setup.h"
 
 // Vista previa de una cara: http://<ip-del-esp32>/cara?c=happy|neutral|thinking|surprised|sad
 void handleCara() {
@@ -814,23 +824,13 @@ void setup() {
     silencioI2S(AUDIO_SAMPLE_RATE / 10);
     renderOLED("neutral", "Iniciando Gimena... Conectando WiFi");
 
-    // 3. Conexión WiFi
-    Serial.printf("Conectando a WiFi: %s", TEST_WIFI_SSID);
-    WiFi.persistent(false);
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect(true);
-    delay(200);
-    WiFi.begin(TEST_WIFI_SSID, TEST_WIFI_PASSWORD);
-
-    int intentos = 0;
-    while (WiFi.status() != WL_CONNECTED && intentos < 40) {
-        delay(500);
-        Serial.print(".");
-        intentos++;
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("\nWiFi Conectado! IP del ESP32: %s\n", WiFi.localIP().toString().c_str());
+    // 3. Conexión WiFi (red guardada desde el portal o la de secrets.h).
+    //    Mantener BOOT (GPIO 0) presionado al arrancar abre el portal directamente.
+    pinMode(0, INPUT_PULLUP);
+    bool forzarPortal = digitalRead(0) == LOW;
+    if (forzarPortal) Serial.println("[Portal] Botón BOOT presionado: abriendo portal WiFi.");
+    if (!forzarPortal && conectarRedConocida()) {
+        Serial.printf("WiFi Conectado! IP del ESP32: %s\n", WiFi.localIP().toString().c_str());
         ultimaRespuesta = "Hola, soy Gimena. Estoy lista para ayudarte.";
         renderOLED("happy", ultimaRespuesta);
 
@@ -853,6 +853,10 @@ void setup() {
         localServer.on("/api/bt/scan", HTTP_POST, handleBtBuscar);
         localServer.on("/api/bt/connect", HTTP_POST, handleBtConectar);
         localServer.on("/api/bt/disconnect", HTTP_POST, handleBtDesconectar);
+        // Cambiar de red sin recompilar: http://<IP>/wifi
+        localServer.on("/wifi", handlePortalPagina);
+        localServer.on("/api/wifi/scan", HTTP_GET, handleWifiEscaneo);
+        localServer.on("/api/wifi/connect", HTTP_POST, handleWifiConectar);
         localServer.begin();
 
         configTime(0, 0, "time.google.com", "pool.ntp.org");
@@ -862,9 +866,9 @@ void setup() {
         // Restaurar el parlante recordado.
         btRestaurarUltimo();
     } else {
-        Serial.printf("\nFallo al conectar WiFi (status=%d). Revisa test_config.h.\n", (int)WiFi.status());
-        ultimaRespuesta = "Sin WiFi. Revisa config.";
-        renderOLED("sad", ultimaRespuesta);
+        Serial.printf("Fallo al conectar WiFi (status=%d). Abriendo portal de configuración.\n", (int)WiFi.status());
+        ultimaRespuesta = "Sin WiFi. Escanea el QR para conectarme.";
+        iniciarPortalWiFi();
     }
 
     Serial.println("\n---------------------------------------------------------");
@@ -881,6 +885,7 @@ void setup() {
 // ------------------------------------------------------------------------------
 void loop() {
     localServer.handleClient();
+    atenderPortalWiFi();
     actualizarPantalla();
     btSupervisar();
 

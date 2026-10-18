@@ -20,6 +20,10 @@
 #define TEST_WIFI_PASSWORD   "12345678"
 #endif
 
+// Red propia (abierta) que crea Gimena cuando no logra conectarse (portal de configuración).
+// Nombre corto: el QR de la OLED debe ser versión 1 (máx. 17 bytes) para verse grande.
+#define PORTAL_AP_SSID       "Gimena"
+
 // ------------------------------------------------------------------------------
 // Gemini directo desde el ESP32. Define la clave real en secrets.h.
 // ------------------------------------------------------------------------------
