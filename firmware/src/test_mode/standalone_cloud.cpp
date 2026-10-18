@@ -31,7 +31,7 @@ public:
 class AudioJson : public Stream {
 public:
     AudioStreamDecoder decoder;
-    AudioJson(uint32_t rate, void (*output)(const uint8_t*, size_t)) : decoder(rate, AUDIO_VOLUMEN, output) {}
+    AudioJson(uint32_t rate, int volume, void (*output)(const uint8_t*, size_t)) : decoder(rate, volume, output) {}
     size_t write(uint8_t c) override { decoder.write(c); return 1; }
     size_t write(const uint8_t* bytes, size_t size) override {
         for (size_t i = 0; i < size; i++) decoder.write(bytes[i]);
@@ -72,6 +72,17 @@ bool beginCloud(HTTPClient& http, WiFiClientSecure& tls, const char* model, Stri
     return true;
 }
 
+// El handshake TLS necesita ~40 KB contiguos; con la pila Bluetooth activa no caben.
+bool sinMemoriaTls(int code, WiFiClientSecure& tls, String& error) {
+    if (code >= 0) return false;
+    char detail[160] = {};
+    int tlsError = tls.lastError(detail, sizeof(detail));
+    Serial.printf("[Cloud] HTTP=%d TLS=%d %s heap=%u max=%u\n", code, tlsError, detail, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    if (tlsError != -32512) return false;   // MBEDTLS_ERR_SSL_ALLOC_FAILED
+    error = "Sin memoria para conectar con Gemini: el Bluetooth ocupa la RAM. Reinicia la placa para liberarla.";
+    return true;
+}
+
 bool checkResponse(int code, String& error) {
     if (code == 200) return true;
     if (code == 429) error = "Se alcanzo la cuota de Gemini. Espera antes de volver a intentarlo.";
@@ -87,12 +98,16 @@ void clearGeminiMemory() {
     historyCount = 0;
 }
 
-bool geminiReply(const String& message, const String& devices, JsonDocument& reply, String& error) {
+bool geminiReply(const String& message, const String& devices, const String& network, JsonDocument& reply, String& error) {
     JsonDocument request;
+    String red = network.length()
+        ? ". Escaneo de la red WiFi recien hecho (SSDP y mDNS), solo informativo, no los controlas: " + network +
+          ". Si preguntan que dispositivos hay en la red, nombralos con su tipo de forma breve"
+        : String("");
     request["systemInstruction"]["parts"][0]["text"] =
         String("Eres Gimena, asistente de hogar de la Universidad de La Guajira. Responde en espanol, sin emojis, ") +
         "con un maximo de 45 palabras. Estas ejecutandote directamente en un ESP32. Solo controla estas salidas: " + devices +
-        ". Devuelve JSON estricto {\"reply\":\"respuesta\",\"face\":\"happy\",\"device_actions\":[]}. " +
+        red + ". Devuelve JSON estricto {\"reply\":\"respuesta\",\"face\":\"happy\",\"device_actions\":[]}. " +
         "face debe ser neutral, happy, love, surprised, sad, thinking o sleepy. " +
         "Si piden encender o apagar una salida, usa device_actions:[{\"device\":\"id\",\"state\":true}]. " +
         "No inventes dispositivos conectados. Recuerda los mensajes anteriores.";
@@ -116,12 +131,7 @@ bool geminiReply(const String& message, const String& devices, JsonDocument& rep
     if (!beginCloud(http, tls, GEMINI_MODEL, error)) return false;
     int code = http.POST(payload);
     payload = "";
-    if (code < 0) {
-        char detail[160] = {};
-        int tlsError = tls.lastError(detail, sizeof(detail));
-        Serial.printf("[Cloud] HTTP=%d TLS=%d %s heap=%u max=%u\n", code, tlsError, detail, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-    }
-    if (!checkResponse(code, error)) { http.end(); return false; }
+    if (sinMemoriaTls(code, tls, error) || !checkResponse(code, error)) { http.end(); return false; }
     BoundedJson body;
     int transferred = http.writeToStream(&body);
     http.end();
@@ -149,7 +159,7 @@ bool geminiReply(const String& message, const String& devices, JsonDocument& rep
     return true;
 }
 
-bool geminiSpeech(const String& text, uint32_t rate, void (*output)(const uint8_t*, size_t), String& error) {
+bool geminiSpeech(const String& text, uint32_t rate, void (*output)(const uint8_t*, size_t), String& error, int volume) {
     JsonDocument request;
     request["contents"][0]["parts"][0]["text"] = "Lee en espanol colombiano, con voz femenina calida, exactamente este texto: " + text;
     request["generationConfig"]["responseModalities"][0] = "AUDIO";
@@ -162,8 +172,8 @@ bool geminiSpeech(const String& text, uint32_t rate, void (*output)(const uint8_
     if (!beginCloud(http, tls, GEMINI_TTS_MODEL, error)) return false;
     int code = http.POST(payload);
     payload = "";
-    if (!checkResponse(code, error)) { http.end(); return false; }
-    AudioJson sink(rate, output);
+    if (sinMemoriaTls(code, tls, error) || !checkResponse(code, error)) { http.end(); return false; }
+    AudioJson sink(rate, volume, output);
     int transferred = http.writeToStream(&sink);
     sink.decoder.finish();
     http.end();

@@ -10,6 +10,10 @@ void salidaVoz(const uint8_t* data, size_t size) {
     serviceStandalone();
 }
 
+bool vozNavegador = false;      // la consulta actual pidió la voz en el navegador
+bool atendiendoPeticionLarga = false;    // un handler largo (voz, escaneo) está activo: no reentrar en handleClient()
+bool vozWebCabeceras = false;
+
 // Atiende peticiones y anima la cara entre bloques descargados de Gemini.
 void serviceStandalone() {
     static bool servicing = false;
@@ -17,7 +21,7 @@ void serviceStandalone() {
     if (servicing) return;
     servicing = true;
     actualizarPantalla();
-    if (millis() - lastWeb >= 25) {
+    if (!atendiendoPeticionLarga && millis() - lastWeb >= 25) {
         lastWeb = millis();
         localServer.handleClient();
     }
@@ -27,15 +31,20 @@ void serviceStandalone() {
 
 void consultarGimena(const String& message) {
     chatRunning = true;
-    bool wantsVoice = hayVoz();
+    bool wantsVoice = !vozNavegador && hayVoz();   // en modo navegador la voz la pide la página
     liberarI2S();  // reserva espacio para el pico de memoria del handshake TLS
     renderOLED("thinking", "Consultando Gemini directamente");
     String states = String("luz_sala (LED GPIO 2): ") + (estadoLuzSala ? "ON" : "OFF") +
         "; luz_cocina (salida GPIO 4): " + (estadoLuzCocina ? "ON" : "OFF") +
         "; ventilador (salida GPIO 5): " + (estadoVentilador ? "ON" : "OFF");
+    String red;
+    if (WiFi.status() == WL_CONNECTED && preguntaPorRed(message)) {
+        asegurarEscaneoRed();   // ~4 s la primera vez; luego se reutiliza unos minutos
+        red = resumenRed();
+    }
     JsonDocument response;
     if (WiFi.status() != WL_CONNECTED) jobError = "El ESP32 no tiene conexion WiFi.";
-    else if (geminiReply(message, states, response, jobError)) {
+    else if (geminiReply(message, states, red, response, jobError)) {
         jobReply = response["reply"].as<String>();
         ultimaRespuesta = jobReply;
         caraActual = response["face"] | "neutral";
@@ -68,7 +77,7 @@ void hablarDirectamente() {
     usandoBT = btConectado() && btStream;
     audioReproduciendo = true;
     uint32_t rate = usandoBT ? 44100 : AUDIO_SAMPLE_RATE;
-    geminiSpeech(jobReply, rate, salidaVoz, voiceError);
+    geminiSpeech(jobReply, rate, salidaVoz, voiceError, AUDIO_VOLUMEN);
     if (usandoBT) {
         unsigned long start = millis();
         while (btStream && xStreamBufferBytesAvailable(btStream) && btConectado() && millis() - start < 2000) {
@@ -85,8 +94,9 @@ bool chatOcupado() {
     return chatPending || chatRunning || voicePending || audioReproduciendo;
 }
 
-bool encolarChat(const String& message) {
+bool encolarChat(const String& message, bool voz_navegador = false) {
     if (chatOcupado()) return false;
+    vozNavegador = voz_navegador;
     pendingMessage = message;
     jobReply = jobError = voiceError = "";
     chatJob++;

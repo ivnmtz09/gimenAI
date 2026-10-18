@@ -391,6 +391,7 @@ static const char WEB_PANEL[] PROGMEM = R"GIMENAI_HTML(
         <div class="header-controls">
             <span class="status-pill" id="esp-status-badge">ESP32 Desconectado</span>
             
+            <button class="btn-action" id="voice-btn" onclick="toggleVoice()" title="Dónde suena la voz de Gimena">Voz: este equipo</button>
             <button class="btn-action" onclick="clearHistory()">Limpiar Chat</button>
         </div>
     </header>
@@ -441,6 +442,108 @@ static const char WEB_PANEL[] PROGMEM = R"GIMENAI_HTML(
         const espStatusBadge = document.getElementById('esp-status-badge');
 
         let chatBusy = false;
+
+        // Voz: 'gemini' = voz de Gemini en este equipo; 'fast' = voz del propio navegador (instantánea);
+        //       'device' = parlante de Gimena (I2S o Bluetooth)
+        const VOICE_LABELS = { gemini: 'Voz: Gemini aquí', fast: 'Voz: rápida aquí', device: 'Voz: parlante Gimena' };
+        const VOICE_ORDER = ['gemini', 'fast', 'device'];
+        const voiceBtn = document.getElementById('voice-btn');
+        let voiceMode = 'gemini';
+        try { voiceMode = localStorage.getItem('gimena-voz') || 'gemini'; } catch(e) {}
+        if (!VOICE_LABELS[voiceMode]) voiceMode = 'gemini';
+        let audioCtx = null;
+
+        function renderVoiceButton() { voiceBtn.textContent = VOICE_LABELS[voiceMode]; }
+
+        function toggleVoice() {
+            voiceMode = VOICE_ORDER[(VOICE_ORDER.indexOf(voiceMode) + 1) % VOICE_ORDER.length];
+            try { localStorage.setItem('gimena-voz', voiceMode); } catch(e) {}
+            renderVoiceButton();
+        }
+
+        // Debe llamarse dentro del clic: los celulares solo permiten audio iniciado por el usuario
+        function unlockAudio() {
+            if (voiceMode === 'fast') {
+                if (window.speechSynthesis) speechSynthesis.speak(new SpeechSynthesisUtterance(''));
+                return;
+            }
+            const Ctx = window.AudioContext || window.webkitAudioContext;
+            if (!Ctx) return;
+            if (!audioCtx) audioCtx = new Ctx();
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+        }
+
+        function speakFast(text) {
+            return new Promise(resolve => {
+                if (!window.speechSynthesis) return resolve();
+                const u = new SpeechSynthesisUtterance(text);
+                u.lang = 'es-CO';
+                const voice = speechSynthesis.getVoices().find(v => v.lang.replace('_', '-').startsWith('es-CO')) ||
+                              speechSynthesis.getVoices().find(v => v.lang.startsWith('es'));
+                if (voice) u.voice = voice;
+                u.onend = u.onerror = () => resolve();
+                speechSynthesis.cancel();
+                speechSynthesis.speak(u);
+            });
+        }
+
+        // La placa envía PCM 16 bit mono a 24 kHz tal como lo genera Gemini TTS, más lento que
+        // tiempo real (la ventana TCP del ESP32 lo limita). Se empieza a reproducir cuando lo ya
+        // recibido alcanza para no cortarse, estimando la duración total por el largo del texto.
+        async function playBrowserVoice(job, text) {
+            if (!audioCtx) throw new Error('Este navegador no permite reproducir audio.');
+            const res = await fetch('/api/chat/voice?job=' + job, { cache: 'no-store' });
+            if (!res.ok) {
+                let msg = 'No se pudo generar la voz';
+                try { msg = (await res.json()).error || msg; } catch(e) {}
+                throw new Error(msg);
+            }
+            const RATE = 24000, BYTES_PER_SEC = RATE * 2;
+            const estimatedSec = Math.max(1.5, text.length / 14);
+            const reader = res.body.getReader();
+            let pending = new Uint8Array(0), total = 0, firstAt = 0, started = false, nextTime = 0;
+
+            const schedule = () => {
+                const usable = pending.length - (pending.length % 2);   // muestras completas de 16 bit
+                if (usable < 2) return;
+                const pcm = new Int16Array(pending.buffer.slice(pending.byteOffset, pending.byteOffset + usable));
+                pending = pending.slice(usable);
+                const buffer = audioCtx.createBuffer(1, pcm.length, RATE);
+                const channel = buffer.getChannelData(0);
+                for (let i = 0; i < pcm.length; i++) channel[i] = pcm[i] / 32768;
+                const source = audioCtx.createBufferSource();
+                source.buffer = buffer;
+                source.connect(audioCtx.destination);
+                nextTime = Math.max(nextTime, audioCtx.currentTime + 0.05);
+                source.start(nextTime);
+                nextTime += buffer.duration;
+            };
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (!firstAt) firstAt = performance.now();
+                const merged = new Uint8Array(pending.length + value.length);
+                merged.set(pending); merged.set(value, pending.length);
+                pending = merged;
+                total += value.length;
+                const receivedSec = total / BYTES_PER_SEC;
+                if (!started) {
+                    const elapsed = (performance.now() - firstAt) / 1000;
+                    const speed = elapsed > 0.3 ? receivedSec / elapsed : 0;   // segundos de audio por segundo
+                    const remaining = Math.max(0, estimatedSec - receivedSec);
+                    const needed = speed >= 1 ? 0.3 : speed > 0 ? remaining * (1 / speed - 1) * 1.15 + 0.3 : Infinity;
+                    if (receivedSec >= needed) started = true;
+                }
+                if (started && pending.length >= BYTES_PER_SEC / 4) schedule();   // bloques de ~0,25 s
+            }
+            schedule();
+            if (!total) throw new Error('Gemini no devolvió audio.');
+            const wait = Math.max(0, nextTime - audioCtx.currentTime);
+            await new Promise(resolve => setTimeout(resolve, wait * 1000 + 100));
+        }
+
+        renderVoiceButton();
 
         async function fetchDevices() {
             if (chatBusy) return;
@@ -526,6 +629,9 @@ static const char WEB_PANEL[] PROGMEM = R"GIMENAI_HTML(
         async function sendMessage() {
             const text = input.value.trim();
             if (!text || chatBusy) return;
+            const mode = voiceMode;
+            const browserVoice = mode !== 'device';
+            if (browserVoice) unlockAudio();
             input.value = '';
             chatBusy = true;
             btRevision++;
@@ -535,17 +641,18 @@ static const char WEB_PANEL[] PROGMEM = R"GIMENAI_HTML(
             sendButton.textContent = 'Pensando...';
             renderBluetooth();
             appendMessage('user', text);
-            let shown = false;
+            let shown = false, replyText = '';
             try {
                 const job = await cloudRequest('/api/chat', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message: text })
+                    body: JSON.stringify({ message: text, voice: browserVoice ? 'browser' : 'device' })
                 });
                 const deadline = Date.now() + 180000;
                 while (true) {
                     const data = await cloudRequest('/api/chat/status?job=' + job.job);
                     if (data.reply && !shown) {
                         appendMessage('bot', data.reply);
+                        replyText = data.reply;
                         shown = true;
                         sendButton.textContent = 'Hablando...';
                     }
@@ -556,6 +663,12 @@ static const char WEB_PANEL[] PROGMEM = R"GIMENAI_HTML(
                     }
                     if (Date.now() >= deadline) throw new Error('La consulta tardó demasiado. Comprueba la conexión del ESP32.');
                     await new Promise(resolve => setTimeout(resolve, 500));
+                }
+                if (browserVoice && shown) {
+                    try {
+                        if (mode === 'fast') await speakFast(replyText);
+                        else await playBrowserVoice(job.job, replyText);
+                    } catch(e) { appendMessage('bot', 'No pude reproducir la voz: ' + e.message); }
                 }
             } catch(e) {
                 appendMessage('bot', e.name === 'AbortError' ? 'El ESP32 tardó demasiado en responder.' : e.message);

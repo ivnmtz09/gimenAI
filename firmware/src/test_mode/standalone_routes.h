@@ -40,7 +40,8 @@ void handleChat() {
     if (!message.length() || message.length() > 500) {
         localServer.send(400, "application/json", "{\"error\":\"Escribe entre 1 y 500 caracteres\"}"); return;
     }
-    if (btObjetivoValido || !encolarChat(message)) {
+    bool vozWeb = body["voice"] == "browser";
+    if (btObjetivoValido || !encolarChat(message, vozWeb)) {
         localServer.send(409, "application/json", "{\"error\":\"Gimena esta ocupada; espera a que termine\"}"); return;
     }
     JsonDocument result; result["job"] = chatJob;
@@ -54,6 +55,84 @@ void handleChatStatus() {
     JsonDocument doc;
     doc["busy"] = chatOcupado(); doc["reply"] = jobReply; doc["face"] = caraActual;
     doc["error"] = jobError; doc["audio_error"] = voiceError;
+    enviarJson(doc);
+}
+
+// Voz en el navegador: PCM 16 bit mono a 24 kHz enviado por bloques (chunked)
+// a medida que llega de Gemini, sin guardar el audio completo en RAM.
+// Se agrupa en bloques de 4 KB y sin Nagle: con trozos de 512 bytes la
+// transferencia caía a ~9 KB/s (cada trozo esperaba el ACK retardado).
+static uint8_t vozWebBuffer[4096];
+static size_t vozWebLlenos = 0;
+
+void vaciarVozWeb() {
+    if (!vozWebLlenos) return;
+    localServer.sendContent((const char*)vozWebBuffer, vozWebLlenos);
+    vozWebLlenos = 0;
+}
+
+void salidaVozWeb(const uint8_t* data, size_t size) {
+    if (!vozWebCabeceras) {
+        vozWebCabeceras = true;
+        localServer.client().setNoDelay(true);
+        localServer.sendHeader("Cache-Control", "no-store");
+        localServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+        localServer.send(200, "application/octet-stream", "");
+    }
+    while (size) {
+        size_t n = min(size, sizeof(vozWebBuffer) - vozWebLlenos);
+        memcpy(vozWebBuffer + vozWebLlenos, data, n);
+        vozWebLlenos += n; data += n; size -= n;
+        if (vozWebLlenos == sizeof(vozWebBuffer)) vaciarVozWeb();
+    }
+}
+
+void hablarEnNavegador() {
+    atendiendoPeticionLarga = true;
+    vozWebCabeceras = false;
+    vozWebLlenos = 0;
+    audioReproduciendo = true;   // la boca de la OLED se mueve mientras se genera la voz
+    String error;
+    bool ok = geminiSpeech(jobReply, 24000, salidaVozWeb, error, 100);
+    audioReproduciendo = false;
+    atendiendoPeticionLarga = false;
+    if (vozWebCabeceras) {
+        vaciarVozWeb();
+        localServer.sendContent("");   // fin de la respuesta por bloques
+    } else {
+        JsonDocument doc;
+        doc["error"] = error.length() ? error : String("Gemini no devolvio audio.");
+        enviarJson(doc, 502);
+    }
+    if (!ok) Serial.printf("[Voz web] %s\n", error.c_str());
+}
+
+void handleChatVoice() {
+    if (localServer.arg("job").toInt() != chatJob || !jobReply.length() || !vozNavegador) {
+        localServer.send(409, "application/json", "{\"error\":\"No hay una respuesta para leer\"}"); return;
+    }
+    if (chatOcupado()) {
+        localServer.send(409, "application/json", "{\"error\":\"Gimena esta ocupada; espera a que termine\"}"); return;
+    }
+    hablarEnNavegador();
+}
+
+// Escaneo IoT bajo demanda (?nuevo=1 ignora la caché)
+void handleNetworkScan() {
+    if (chatOcupado()) { localServer.send(409, "application/json", "{\"error\":\"Espera a que termine la consulta\"}"); return; }
+    atendiendoPeticionLarga = true;
+    if (localServer.hasArg("nuevo")) escanearRed(); else asegurarEscaneoRed();
+    atendiendoPeticionLarga = false;
+    JsonDocument doc;
+    doc["age_s"] = (millis() - redEscaneadoEn) / 1000;
+    JsonArray lista = doc["devices"].to<JsonArray>();
+    for (int i = 0; i < redCantidad; i++) {
+        JsonObject d = lista.add<JsonObject>();
+        d["ip"] = redDispositivos[i].ip.toString();
+        d["name"] = redDispositivos[i].nombre;
+        d["type"] = redDispositivos[i].tipo;
+        d["manufacturer"] = redDispositivos[i].fabricante;
+    }
     enviarJson(doc);
 }
 

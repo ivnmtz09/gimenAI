@@ -646,6 +646,7 @@ void salidaAudio(const uint8_t* datos, int n) {
     }
 }
 
+#include "network_scan.h"
 #include "standalone_chat.h"
 
 // ------------------------------------------------------------------------------
@@ -843,8 +844,10 @@ void setup() {
         localServer.on(UriBraces("/api/devices/{}/toggle"), HTTP_POST, handleToggle);
         localServer.on("/api/chat", HTTP_POST, handleChat);
         localServer.on("/api/chat/status", HTTP_GET, handleChatStatus);
+        localServer.on("/api/chat/voice", HTTP_GET, handleChatVoice);
         localServer.on("/api/chat/history", HTTP_DELETE, handleClearHistory);
         localServer.on("/api/network/check", HTTP_POST, handleNetworkCheck);
+        localServer.on("/api/network/scan", HTTP_GET, handleNetworkScan);
         localServer.on("/api/bluetooth", HTTP_GET, handleBtEstado);
         localServer.on("/api/bluetooth/scan", HTTP_POST, handleBtBuscar);
         localServer.on("/api/bluetooth/connect", HTTP_POST, handleBtConectar);
@@ -860,6 +863,8 @@ void setup() {
         localServer.begin();
 
         configTime(0, 0, "time.google.com", "pool.ntp.org");
+        MDNS.begin("gimena");   // necesario para el escaneo mDNS; además publica http://gimena.local/
+        MDNS.addService("http", "tcp", 80);
         Serial.printf("[Autonomo] Abre http://%s/ en tu celular o computador.\n", WiFi.localIP().toString().c_str());
         renderOLED("happy", ultimaRespuesta, true);
 
