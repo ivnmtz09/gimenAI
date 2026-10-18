@@ -14,7 +14,7 @@ load_dotenv()
 
 API_KEY = os.getenv("GEMINI_API_KEY")
 if not API_KEY or API_KEY == "tu_clave_api_de_google_aqui":
-    print("⚠️  ADVERTENCIA: GEMINI_API_KEY no está configurada en server/.env")
+    print("ADVERTENCIA: GEMINI_API_KEY no esta configurada en server/.env")
 
 # Cliente oficial de Google GenAI
 try:
@@ -40,17 +40,15 @@ smart_devices: Dict[str, Dict[str, Any]] = {}
 # Nodos ESP32 conectados en la red
 esp32_nodes: Dict[str, Dict[str, Any]] = {}
 
-# Dispositivos de red descubiertos (mDNS / Smart TVs, etc.)
+# Dispositivos de red descubiertos (mDNS)
 discovered_network_devices: List[Dict[str, Any]] = []
 
 # ==============================================================================
 # Historial de Conversación Real (Memoria Multi-Turn)
 # ==============================================================================
-# Guarda los turnos de diálogo: [{"role": "user"|"model", "text": "..."}]
 conversation_memory: List[Dict[str, str]] = []
 
 def get_system_prompt() -> str:
-    # Resumen de dispositivos disponibles
     devices_lines = []
     if smart_devices:
         for d_id, d in smart_devices.items():
@@ -62,31 +60,29 @@ def get_system_prompt() -> str:
 
     devices_str = "\n".join(devices_lines)
 
-    # Nodos ESP32 físicos detectados
     esp_lines = []
     if esp32_nodes:
         for node_id, node in esp32_nodes.items():
             esp_lines.append(f"- Nodo ESP32 '{node_id}' en IP {node.get('ip')}")
     else:
-        esp_lines.append("- Ningún ESP32 conectado todavía. Esperando que el ESP32 encienda y se conecte a la red WiFi.")
+        esp_lines.append("- Ningún ESP32 conectado todavía. Esperando conexión a la red WiFi.")
 
     esp_str = "\n".join(esp_lines)
-
-    # Dispositivos de red descubiertos
-    net_str = f"{len(discovered_network_devices)} dispositivos en red local" if discovered_network_devices else "Ninguno adicional escaneado"
+    net_str = f"{len(discovered_network_devices)} dispositivos detectados en red local" if discovered_network_devices else "Ninguno adicional"
 
     return f"""
-Eres Gimena, un robot interactivo asistente de hogar con personalidad propia, creado en la Universidad de La Guajira.
-Tu tono es siempre cálido, empático, claro, inteligente y conciso (apto para mostrarse en pantalla OLED y leerse en voz alta).
+Eres Gimena, un asistente interactivo para el hogar, desarrollado en la Universidad de La Guajira.
+Tu tono es respetuoso, empático, claro, conciso y formal pero accesible.
 
-REGLAS DE CONVERSACIÓN REAL:
-1. Recuerdas los mensajes previos de la conversación actual. Si el usuario te dice su nombre, gustos o hace referencia a algo anterior ("apágalo", "cuál es mi nombre"), debes recordarlo fielmente.
-2. Si te preguntan qué dispositivos inteligentes detectas, explica con detalle los bombillos, nodos ESP32 y dispositivos que ves en tu lista.
-3. Si el usuario pide encender, apagar o ajustar dispositivos:
-   - Responde de forma muy natural y agradable.
+REGLAS OBLIGATORIAS:
+1. No utilices emojis ni caracteres de emoticonos en tus respuestas bajo ninguna circunstancia.
+2. Recuerdas los mensajes previos de la conversación actual. Si el usuario te indica su nombre o hace referencia a algo anterior, recuérdalo con fidelidad.
+3. Si el usuario pregunta qué dispositivos tienes o detectas, responde basándote exactamente en la lista siguiente. Si no hay dispositivos, indícalo claramente con sinceridad.
+4. Si el usuario pide encender, apagar o ajustar dispositivos:
+   - Responde de forma natural sin emojis.
    - Incluye los cambios en la lista "device_actions".
 
-DISPOSITIVOS INTELIGENTES REGISTRADOS:
+DISPOSITIVOS REGISTRADOS:
 {devices_str}
 
 NODOS ESP32 HARDWARE EN LA RED:
@@ -97,8 +93,8 @@ RED LOCAL:
 
 FORMATO OBLIGATORIO DE RESPUESTA (JSON ESTRICTO):
 {{
-  "reply": "Texto de la respuesta para el usuario",
-  "face": "happy" | "neutral" | "thinking" | "surprised",
+  "reply": "Texto de la respuesta en español para el usuario",
+  "face": "neutral",
   "device_actions": [
      {{ "device": "id_del_dispositivo", "state": true/false }}
   ]
@@ -107,9 +103,9 @@ Si no modificas dispositivos, "device_actions" debe ser [].
 """
 
 app = FastAPI(
-    title="GimenAI IoT Gateway & Smart Chat",
-    description="Servidor con chat real, descubrimiento de dispositivos y control domótico para ESP32",
-    version="2.1.0"
+    title="GimenAI IoT Gateway",
+    description="Servidor con chat y control domotico para ESP32",
+    version="2.2.0"
 )
 
 app.add_middleware(
@@ -138,25 +134,21 @@ def generate_chat_response(user_message: str) -> Dict[str, Any]:
     if not API_KEY or API_KEY == "tu_clave_api_de_google_aqui":
         return {
             "reply": "No has configurado tu GEMINI_API_KEY en server/.env todavía.",
-            "face": "thinking",
+            "face": "neutral",
             "device_actions": []
         }
 
     sys_instruction = get_system_prompt()
     candidate_models = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-flash-latest"]
 
-    # Construir contenido con historial de conversación
-    # Mantener los últimos 12 turnos para contexto rico y rápido
     recent_history = conversation_memory[-12:]
-    
-    # Formatear el historial para Gemini
     dialog_context = ""
     for turn in recent_history:
         role_label = "Usuario" if turn["role"] == "user" else "Gimena"
         dialog_context += f"{role_label}: {turn['text']}\n"
     dialog_context += f"Usuario: {user_message}\nGimena:"
 
-    full_prompt = f"HISTORIAL DE CONVERSACIÓN:\n{dialog_context}\n\nResponde como Gimena a la última intervención en JSON estricto."
+    full_prompt = f"HISTORIAL DE CONVERSACION:\n{dialog_context}\n\nResponde como Gimena en JSON estricto sin emojis."
 
     for model_name in candidate_models:
         try:
@@ -182,18 +174,17 @@ def generate_chat_response(user_message: str) -> Dict[str, Any]:
 
             data = json.loads(raw_text)
 
-            # Guardar en memoria multi-turn
             conversation_memory.append({"role": "user", "text": user_message})
             conversation_memory.append({"role": "model", "text": data.get("reply", "")})
 
             return data
         except Exception as e:
-            print(f"Intento con {model_name} falló: {e}")
+            print(f"Intento con {model_name} fallo: {e}")
             continue
 
     return {
-        "reply": "Tuve una pequeña dificultad para comunicarme con mis servicios en la nube.",
-        "face": "thinking",
+        "reply": "Ocurrio una dificultad al comunicarse con los servicios de inteligencia en la nube.",
+        "face": "neutral",
         "device_actions": []
     }
 
@@ -201,13 +192,11 @@ def generate_chat_response(user_message: str) -> Dict[str, Any]:
 # Notificar a un ESP32 Físico en la Red
 # ==============================================================================
 async def notify_esp32_physical(device_id: str, new_state: bool):
-    """Si el dispositivo está asociado a una IP de un ESP32, le envía la orden vía HTTP."""
     device = smart_devices.get(device_id)
     if not device:
         return
 
     esp_ip = device.get("ip")
-    # Si no tiene IP directa asignada pero hay un nodo ESP32 registrado, usamos la de ese nodo
     if not esp_ip and esp32_nodes:
         first_node = next(iter(esp32_nodes.values()))
         esp_ip = first_node.get("ip")
@@ -228,26 +217,22 @@ async def notify_esp32_physical(device_id: str, new_state: bool):
 
 @app.post("/api/chat")
 async def chat_endpoint(req: ChatRequest):
-    """Chat conversacional con memoria y control domótico."""
     user_msg = req.message.strip()
     print(f"\n[MENSAJE USUARIO]: {user_msg}")
 
     result = generate_chat_response(user_msg)
     reply_text = result.get("reply", "Entendido.")
-    face = result.get("face", "happy")
+    face = result.get("face", "neutral")
     actions = result.get("device_actions", [])
 
-    # Aplicar acciones de dispositivos
     for action in actions:
         d_id = action.get("device")
         st = action.get("state")
         if d_id in smart_devices and st is not None:
             smart_devices[d_id]["state"] = bool(st)
-            print(f"[DOMÓTICA]: {d_id} cambiado a {st}")
-            # Notificar al ESP32 por hardware si está en línea
+            print(f"[DOMOTICA]: {d_id} cambiado a {st}")
             asyncio.create_task(notify_esp32_physical(d_id, bool(st)))
 
-    # Generar vista simple para dispositivos
     devices_summary = {k: v["state"] for k, v in smart_devices.items()}
 
     return {
@@ -260,19 +245,16 @@ async def chat_endpoint(req: ChatRequest):
 
 @app.get("/api/chat/history")
 def get_chat_history():
-    """Retorna el historial completo de la conversación."""
     return {"history": conversation_memory}
 
 @app.delete("/api/chat/history")
 def clear_chat_history():
-    """Borra la memoria de la conversación para iniciar un chat nuevo."""
     global conversation_memory
     conversation_memory = []
-    return {"status": "cleared", "message": "Historial de conversación reiniciado."}
+    return {"status": "cleared", "message": "Historial de conversacion reiniciado."}
 
 @app.get("/api/devices")
 def get_all_devices():
-    """Consulta la lista de dispositivos inteligentes y nodos ESP32 conectados."""
     return {
         "devices": smart_devices,
         "esp32_nodes": esp32_nodes,
@@ -281,7 +263,6 @@ def get_all_devices():
 
 @app.post("/api/devices/{device_id}/toggle")
 async def toggle_device_endpoint(device_id: str):
-    """Alterna manualmente el estado de un dispositivo desde la web."""
     if device_id in smart_devices:
         new_state = not smart_devices[device_id]["state"]
         smart_devices[device_id]["state"] = new_state
@@ -296,7 +277,6 @@ async def toggle_device_endpoint(device_id: str):
 
 @app.post("/api/devices/register")
 def register_esp32_node(req: ESP32RegisterRequest):
-    """El ESP32 llama a este endpoint al arrancar para anunciar su IP y dispositivos."""
     esp32_nodes[req.id] = {
         "id": req.id,
         "name": req.name,
@@ -305,7 +285,6 @@ def register_esp32_node(req: ESP32RegisterRequest):
         "last_seen": int(time.time())
     }
     
-    # Agregar dinámicamente el bombillo físico del ESP32 al registro de dispositivos
     if "luz_sala" in req.capabilities:
         smart_devices["luz_sala"] = {
             "id": "luz_sala",
@@ -318,9 +297,7 @@ def register_esp32_node(req: ESP32RegisterRequest):
             "description": f"LED integrado en ESP32 DevKit (GPIO 2) en {req.ip}"
         }
 
-    print(f"\n🎉 [NUEVO DISPOSITIVO HARDWARE DETECTADO]: {req.name} ({req.id}) en IP {req.ip}")
-    print(f"   Capacidades registradas: {req.capabilities}\n")
-
+    print(f"\n[DISPOSITIVO DETECTADO]: {req.name} ({req.id}) en IP {req.ip}")
     return {
         "status": "registered",
         "assigned_ip": req.ip,
@@ -329,7 +306,6 @@ def register_esp32_node(req: ESP32RegisterRequest):
 
 @app.get("/api/devices/scan")
 async def scan_network_devices():
-    """Escanea la red local para descubrir dispositivos inteligentes activos."""
     global discovered_network_devices
     discovered = []
 
@@ -354,8 +330,7 @@ async def scan_network_devices():
         services = [
             "_http._tcp.local.",
             "_googlecast._tcp.local.",
-            "_esphomelib._tcp.local.",
-            "_airplay._tcp.local."
+            "_esphomelib._tcp.local."
         ]
         browser = ServiceBrowser(zc, services, SmartListener())
         await asyncio.sleep(2)
@@ -372,7 +347,7 @@ async def scan_network_devices():
     }
 
 # ==============================================================================
-# Interfaz Web Completa (Panel de Control y Chat en Tiempo Real)
+# Interfaz Web Responsiva, Minimalista y Sin Emojis ni Iconos
 # ==============================================================================
 @app.get("/", response_class=HTMLResponse)
 def get_web_ui():
@@ -381,100 +356,412 @@ def get_web_ui():
 <html lang="es">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>GimenAI - Asistente & Domótica Real</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>GimenAI - Asistente Domotico</title>
     <style>
         :root {
-            --bg-dark: #0b1120;
-            --panel-bg: #1e293b;
-            --panel-border: #334155;
-            --primary: #38bdf8;
-            --primary-hover: #0ea5e9;
-            --accent-on: #22c55e;
-            --accent-off: #64748b;
-            --text-main: #f8fafc;
-            --text-muted: #94a3b8;
+            --bg: #090d16;
+            --surface: #111827;
+            --surface-hover: #1f2937;
+            --surface-border: #1e293b;
+            --primary: #0284c7;
+            --primary-hover: #0369a1;
+            --text-primary: #f8fafc;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
         }
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-        body { background: var(--bg-dark); color: var(--text-main); display: flex; flex-direction: column; height: 100vh; }
 
-        header { background: var(--panel-bg); padding: 14px 20px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--panel-border); }
-        header h1 { font-size: 1.2rem; color: var(--primary); display: flex; align-items: center; gap: 8px; }
-        .header-actions { display: flex; gap: 8px; align-items: center; }
-        .badge { font-size: 0.75rem; background: #064e3b; color: #34d399; padding: 5px 12px; border-radius: 999px; font-weight: bold; }
-        .btn-scan { background: #0284c7; color: white; border: none; padding: 6px 12px; border-radius: 6px; font-size: 0.8rem; cursor: pointer; font-weight: bold; }
-        .btn-clear { background: #475569; color: #f8fafc; border: none; padding: 6px 10px; border-radius: 6px; font-size: 0.8rem; cursor: pointer; }
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            -webkit-tap-highlight-color: transparent;
+        }
 
-        /* Panel de Dispositivos */
-        .hardware-banner { background: #172554; border-bottom: 1px solid #1e40af; padding: 8px 20px; font-size: 0.85rem; display: flex; justify-content: space-between; align-items: center; color: #93c5fd; }
-        .dashboard { background: #0f172a; padding: 12px 20px; display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; border-bottom: 1px solid var(--panel-border); }
-        .device-card { background: var(--panel-bg); padding: 12px; border-radius: 8px; text-align: center; border: 1px solid var(--panel-border); transition: 0.2s; }
-        .device-card h4 { font-size: 0.82rem; color: var(--text-muted); margin-bottom: 4px; }
-        .device-type { font-size: 0.7rem; color: #64748b; margin-bottom: 8px; }
-        .device-btn { width: 100%; border: none; padding: 7px; border-radius: 6px; font-weight: bold; cursor: pointer; transition: 0.2s; font-size: 0.85rem; }
-        .btn-on { background: #16a34a; color: white; box-shadow: 0 0 10px rgba(34,197,94,0.3); }
-        .btn-off { background: #334155; color: #cbd5e1; }
+        body {
+            background: var(--bg);
+            color: var(--text-primary);
+            height: 100vh;
+            height: 100dvh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
 
-        /* Chat */
-        .chat-container { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
-        .message { max-width: 78%; padding: 12px 16px; border-radius: 12px; font-size: 0.95rem; line-height: 1.45; animation: fadeIn 0.2s ease; }
-        .user-msg { align-self: flex-end; background: #0284c7; color: white; border-bottom-right-radius: 2px; }
-        .bot-msg { align-self: flex-start; background: var(--panel-bg); border: 1px solid var(--panel-border); border-bottom-left-radius: 2px; }
-        .bot-header { font-size: 0.75rem; color: var(--primary); margin-bottom: 4px; font-weight: bold; }
+        header {
+            background: var(--surface);
+            border-bottom: 1px solid var(--surface-border);
+            padding: 14px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-shrink: 0;
+        }
 
-        .chips { display: flex; gap: 8px; overflow-x: auto; padding: 8px 20px; background: #0f172a; border-top: 1px solid var(--panel-border); }
-        .chip { background: var(--panel-bg); color: var(--text-muted); border: 1px solid var(--panel-border); padding: 6px 12px; border-radius: 999px; font-size: 0.8rem; white-space: nowrap; cursor: pointer; }
-        .chip:hover { color: var(--primary); border-color: var(--primary); }
+        .brand-container {
+            display: flex;
+            flex-direction: column;
+        }
 
-        footer { background: var(--panel-bg); padding: 12px 20px; border-top: 1px solid var(--panel-border); display: flex; gap: 10px; }
-        input[type="text"] { flex: 1; background: #0b1120; border: 1px solid var(--panel-border); color: white; padding: 12px 16px; border-radius: 8px; font-size: 1rem; outline: none; }
-        input[type="text"]:focus { border-color: var(--primary); }
-        button.send-btn { background: var(--primary); color: #0b1120; border: none; font-weight: bold; padding: 0 22px; border-radius: 8px; cursor: pointer; font-size: 1rem; }
-        button.send-btn:hover { background: var(--primary-hover); }
+        .brand-title {
+            font-size: 1.15rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            color: var(--text-primary);
+        }
 
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+        .brand-subtitle {
+            font-size: 0.72rem;
+            color: var(--text-muted);
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-top: 2px;
+        }
+
+        .header-controls {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .status-pill {
+            font-size: 0.7rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            padding: 5px 10px;
+            border-radius: 4px;
+            background: var(--surface-hover);
+            color: var(--text-muted);
+            border: 1px solid var(--surface-border);
+        }
+
+        .status-pill.online {
+            background: rgba(5, 150, 105, 0.15);
+            color: #34d399;
+            border-color: rgba(5, 150, 105, 0.35);
+        }
+
+        .btn-action {
+            background: var(--surface-hover);
+            color: var(--text-secondary);
+            border: 1px solid var(--surface-border);
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-size: 0.76rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+
+        .btn-action:hover {
+            color: var(--text-primary);
+            border-color: var(--primary);
+        }
+
+        /* Sección de Dispositivos: Oculta por defecto, solo visible si hay dispositivos */
+        #devices-section {
+            display: none;
+            background: #0d1322;
+            border-bottom: 1px solid var(--surface-border);
+            padding: 14px 20px;
+            flex-shrink: 0;
+            animation: fadeIn 0.2s ease;
+        }
+
+        .section-header {
+            font-size: 0.72rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-muted);
+            margin-bottom: 10px;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .devices-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 10px;
+        }
+
+        .device-card {
+            background: var(--surface);
+            border: 1px solid var(--surface-border);
+            border-radius: 6px;
+            padding: 12px 14px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+
+        .device-info {
+            overflow: hidden;
+        }
+
+        .device-name {
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .device-meta {
+            font-size: 0.72rem;
+            color: var(--text-muted);
+            margin-top: 3px;
+        }
+
+        .toggle-btn {
+            padding: 6px 14px;
+            font-size: 0.72rem;
+            font-weight: 600;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background 0.15s ease;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+
+        .toggle-btn.state-on {
+            background: #15803d;
+            color: #f0fdf4;
+        }
+
+        .toggle-btn.state-off {
+            background: #334155;
+            color: #94a3b8;
+        }
+
+        /* Area de Chat */
+        .chat-area {
+            flex: 1;
+            min-height: 0;
+            overflow-y: auto;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
+
+        .chat-message {
+            max-width: 80%;
+            padding: 12px 16px;
+            border-radius: 8px;
+            font-size: 0.92rem;
+            line-height: 1.5;
+            word-break: break-word;
+            animation: fadeIn 0.15s ease;
+        }
+
+        .chat-message.user {
+            align-self: flex-end;
+            background: #0284c7;
+            color: #ffffff;
+            border-bottom-right-radius: 2px;
+        }
+
+        .chat-message.bot {
+            align-self: flex-start;
+            background: var(--surface);
+            border: 1px solid var(--surface-border);
+            color: var(--text-primary);
+            border-bottom-left-radius: 2px;
+        }
+
+        .message-author {
+            font-size: 0.72rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: var(--text-secondary);
+            margin-bottom: 4px;
+        }
+
+        .chat-message.user .message-author {
+            color: #bae6fd;
+        }
+
+        /* Acciones Rapidas (Chips) */
+        .quick-actions {
+            display: flex;
+            gap: 8px;
+            overflow-x: auto;
+            padding: 8px 20px;
+            background: var(--surface);
+            border-top: 1px solid var(--surface-border);
+            flex-shrink: 0;
+            scrollbar-width: none;
+        }
+
+        .quick-actions::-webkit-scrollbar {
+            display: none;
+        }
+
+        .action-chip {
+            background: var(--surface-hover);
+            color: var(--text-secondary);
+            border: 1px solid var(--surface-border);
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            white-space: nowrap;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+
+        .action-chip:hover {
+            color: var(--text-primary);
+            border-color: var(--primary);
+        }
+
+        /* Pie de Pagina / Entrada de Texto */
+        footer {
+            background: var(--surface);
+            padding: 14px 20px;
+            border-top: 1px solid var(--surface-border);
+            display: flex;
+            gap: 10px;
+            flex-shrink: 0;
+        }
+
+        .input-text {
+            flex: 1;
+            background: var(--bg);
+            border: 1px solid var(--surface-border);
+            color: var(--text-primary);
+            padding: 12px 14px;
+            border-radius: 6px;
+            font-size: 0.95rem;
+            outline: none;
+            transition: border-color 0.15s ease;
+        }
+
+        .input-text:focus {
+            border-color: var(--primary);
+        }
+
+        .btn-send {
+            background: var(--primary);
+            color: #ffffff;
+            border: none;
+            font-weight: 600;
+            font-size: 0.88rem;
+            padding: 0 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background 0.15s ease;
+        }
+
+        .btn-send:hover {
+            background: var(--primary-hover);
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(4px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Adaptacion Responsiva para Moviles */
+        @media (max-width: 640px) {
+            header {
+                padding: 10px 14px;
+            }
+            .brand-title {
+                font-size: 1rem;
+            }
+            .brand-subtitle {
+                display: none;
+            }
+            .btn-action {
+                padding: 6px 8px;
+                font-size: 0.72rem;
+            }
+            #devices-section {
+                padding: 10px 14px;
+            }
+            .devices-grid {
+                grid-template-columns: 1fr;
+            }
+            .chat-area {
+                padding: 14px 12px;
+            }
+            .chat-message {
+                max-width: 90%;
+                font-size: 0.88rem;
+                padding: 10px 12px;
+            }
+            .quick-actions {
+                padding: 6px 12px;
+            }
+            footer {
+                padding: 10px 12px;
+            }
+            .input-text {
+                font-size: 0.9rem;
+                padding: 10px 12px;
+            }
+            .btn-send {
+                padding: 0 14px;
+            }
+        }
     </style>
 </head>
 <body>
     <header>
-        <h1>🤖 Gimena — Asistente de Hogar</h1>
-        <div class="header-actions">
-            <span class="badge" id="esp-status-badge">ESP32: Esperando conexión</span>
-            <button class="btn-scan" onclick="scanNetwork()">🔍 Escanear Red</button>
-            <button class="btn-clear" onclick="clearHistory()">🗑️ Limpiar Chat</button>
+        <div class="brand-container">
+            <span class="brand-title">GimenAI</span>
+            <span class="brand-subtitle">Asistente Domotico</span>
+        </div>
+        <div class="header-controls">
+            <span class="status-pill" id="esp-status-badge">ESP32 Desconectado</span>
+            <button class="btn-action" onclick="scanNetwork()">Escanear Red</button>
+            <button class="btn-action" onclick="clearHistory()">Limpiar Chat</button>
         </div>
     </header>
 
-    <div class="hardware-banner" id="hardware-banner">
-        <span>Hardware: ESP32 DevKit V1 (LED GPIO 2 asignado a Bombillo Sala)</span>
-        <span id="nodes-count">0 Nodos detectados</span>
-    </div>
+    <!-- Solo visible cuando hay dispositivos registrados -->
+    <section id="devices-section">
+        <div class="section-header">
+            <span>Dispositivos Activos</span>
+            <span id="devices-count">0</span>
+        </div>
+        <div class="devices-grid" id="devices-dashboard"></div>
+    </section>
 
-    <div class="dashboard" id="devices-dashboard"></div>
-
-    <div class="chat-container" id="chat">
-        <div class="message bot-msg">
-            <div class="bot-header">Gimena (^.^)</div>
-            ¡Hola! Soy Gimena. Tengo control sobre los dispositivos inteligentes de tu hogar y recuerdo toda nuestra conversación. Puedes pedirme que encienda los bombillos o preguntarme lo que necesites.
+    <div class="chat-area" id="chat">
+        <div class="chat-message bot">
+            <div class="message-author">Gimena</div>
+            Hola. Soy Gimena, tu asistente de hogar. Puedes darme instrucciones de control o hacerme cualquier consulta.
         </div>
     </div>
 
-    <div class="chips">
-        <div class="chip" onclick="sendChip('Enciende la luz de la sala')">💡 Enciende luz sala</div>
-        <div class="chip" onclick="sendChip('Apaga todos los bombillos')">🌑 Apaga todo</div>
-        <div class="chip" onclick="sendChip('¿Qué dispositivos inteligentes detectas?')">🔍 ¿Qué dispositivos detectas?</div>
-        <div class="chip" onclick="sendChip('Me llamo Iván, recuérdalo')">👤 Mi nombre es Iván</div>
-        <div class="chip" onclick="sendChip('¿Cómo me llamo y qué luces tienes encendidas?')">🧠 ¿Cómo me llamo y qué luces hay?</div>
+    <div class="quick-actions">
+        <div class="action-chip" onclick="sendChip('Estado de dispositivos')">Estado de dispositivos</div>
+        <div class="action-chip" onclick="sendChip('Enciende la luz de la sala')">Encender luz de sala</div>
+        <div class="action-chip" onclick="sendChip('Apaga todos los dispositivos')">Apagar dispositivos</div>
+        <div class="action-chip" onclick="sendChip('¿Que dispositivos hay en la casa?')">Dispositivos detectados</div>
     </div>
 
     <footer>
-        <input type="text" id="userInput" placeholder="Escribe un mensaje o comando a Gimena..." onkeydown="if(event.key==='Enter') sendMessage()">
-        <button class="send-btn" onclick="sendMessage()">Enviar</button>
+        <input type="text" class="input-text" id="userInput" placeholder="Escribe un mensaje o instruccion..." onkeydown="if(event.key==='Enter') sendMessage()">
+        <button class="btn-send" onclick="sendMessage()">Enviar</button>
     </footer>
 
     <script>
         const chatDiv = document.getElementById('chat');
         const input = document.getElementById('userInput');
+        const devicesSection = document.getElementById('devices-section');
+        const devicesDashboard = document.getElementById('devices-dashboard');
+        const devicesCount = document.getElementById('devices-count');
+        const espStatusBadge = document.getElementById('esp-status-badge');
 
         async function fetchDevices() {
             try {
@@ -487,44 +774,47 @@ def get_web_ui():
 
         function updateHardwareStatus(nodes) {
             const count = Object.keys(nodes).length;
-            const badge = document.getElementById('esp-status-badge');
-            const nodesCount = document.getElementById('nodes-count');
             if (count > 0) {
                 const first = Object.values(nodes)[0];
-                badge.textContent = `● ESP32 Online (${first.ip})`;
-                badge.style.background = '#064e3b';
-                badge.style.color = '#34d399';
-                nodesCount.textContent = `${count} ESP32 conectado (${first.ip})`;
+                espStatusBadge.textContent = 'ESP32 Conectado (' + first.ip + ')';
+                espStatusBadge.className = 'status-pill online';
             } else {
-                badge.textContent = `○ ESP32: Esperando señal WiFi`;
-                badge.style.background = '#475569';
-                badge.style.color = '#cbd5e1';
-                nodesCount.textContent = `Modo Simulado / Esperando ESP32`;
+                espStatusBadge.textContent = 'ESP32 Desconectado';
+                espStatusBadge.className = 'status-pill';
             }
         }
 
         function renderDashboard(devices) {
-            const container = document.getElementById('devices-dashboard');
-            container.innerHTML = '';
+            devicesDashboard.innerHTML = '';
             const keys = Object.keys(devices);
+
+            // Si NO hay dispositivos, se oculta completamente la sección
             if (keys.length === 0) {
-                container.innerHTML = '<div style="grid-column: 1 / -1; color: #94a3b8; font-size: 0.88rem; padding: 6px 0;">ℹ️ <b>Sin dispositivos activos en este momento.</b> Conecta tu ESP32 a la WiFi para que se registre automáticamente su LED integrado, o pulsa "🔍 Escanear Red".</div>';
+                devicesSection.style.display = 'none';
                 return;
             }
+
+            // Si hay dispositivos, se muestra la sección
+            devicesSection.style.display = 'block';
+            devicesCount.textContent = keys.length.toString();
+
             for (const [key, dev] of Object.entries(devices)) {
                 const card = document.createElement('div');
                 card.className = 'device-card';
-                const isLight = dev.type === 'light';
-                const icon = isLight ? (dev.state ? '💡' : '🌑') : (dev.state ? '🌀' : '💨');
-                const targetLabel = dev.target === 'esp32_hardware' ? '⚡ ESP32 GPIO ' + dev.pin : 'Virtual';
+                const targetLabel = dev.target === 'esp32_hardware' ? 'ESP32 GPIO ' + dev.pin : 'Virtual';
+                const stateClass = dev.state ? 'state-on' : 'state-off';
+                const stateLabel = dev.state ? 'Encendido' : 'Apagado';
+
                 card.innerHTML = `
-                    <h4>${icon} ${dev.name}</h4>
-                    <div class="device-type">${targetLabel}</div>
-                    <button class="device-btn ${dev.state ? 'btn-on' : 'btn-off'}" onclick="toggleDevice('${key}')">
-                        ${dev.state ? 'ENCENDIDO' : 'APAGADO'}
+                    <div class="device-info">
+                        <div class="device-name">${dev.name}</div>
+                        <div class="device-meta">${targetLabel}</div>
+                    </div>
+                    <button class="toggle-btn ${stateClass}" onclick="toggleDevice('${key}')">
+                        ${stateLabel}
                     </button>
                 `;
-                container.appendChild(card);
+                devicesDashboard.appendChild(card);
             }
         }
 
@@ -534,11 +824,11 @@ def get_web_ui():
         }
 
         async function scanNetwork() {
-            appendMessage('bot', 'Escaneando dispositivos inteligentes en la red local... 🔍');
+            appendMessage('bot', 'Escaneando la red local en busca de dispositivos...');
             try {
                 const res = await fetch('/api/devices/scan');
                 const data = await res.json();
-                appendMessage('bot', `Escaneo completado. Se detectaron ${data.count} dispositivos en la red local.`);
+                appendMessage('bot', `Escaneo finalizado. Se detectaron ${data.count} dispositivos.`);
                 fetchDevices();
             } catch(e) {
                 appendMessage('bot', 'Error al escanear la red.');
@@ -548,9 +838,9 @@ def get_web_ui():
         async function clearHistory() {
             await fetch('/api/chat/history', { method: 'DELETE' });
             chatDiv.innerHTML = `
-                <div class="message bot-msg">
-                    <div class="bot-header">Gimena (^.^)</div>
-                    Memoria reiniciada. ¿En qué te puedo ayudar ahora?
+                <div class="chat-message bot">
+                    <div class="message-author">Gimena</div>
+                    Conversacion reiniciada. ¿En que puedo ayudarte?
                 </div>
             `;
         }
@@ -574,22 +864,18 @@ def get_web_ui():
                     body: JSON.stringify({ message: text })
                 });
                 const data = await res.json();
-                appendMessage('bot', data.reply, data.face);
+                appendMessage('bot', data.reply);
                 fetchDevices();
             } catch (err) {
-                appendMessage('bot', 'Error de conexión con el servidor.');
+                appendMessage('bot', 'Error al conectar con el servidor.');
             }
         }
 
-        function appendMessage(sender, text, face = 'happy') {
+        function appendMessage(sender, text) {
             const msg = document.createElement('div');
-            msg.className = `message ${sender === 'user' ? 'user-msg' : 'bot-msg'}`;
-            if (sender === 'bot') {
-                const faceIcon = face === 'happy' ? '(^.^)' : (face === 'surprised' ? '(O.O)' : (face === 'thinking' ? '(~.~)' : '(o.o)'));
-                msg.innerHTML = `<div class="bot-header">Gimena ${faceIcon}</div>` + text;
-            } else {
-                msg.textContent = text;
-            }
+            msg.className = `chat-message ${sender === 'user' ? 'user' : 'bot'}`;
+            const author = sender === 'user' ? 'Tu' : 'Gimena';
+            msg.innerHTML = `<div class="message-author">${author}</div>` + text;
             chatDiv.appendChild(msg);
             chatDiv.scrollTop = chatDiv.scrollHeight;
         }
