@@ -589,39 +589,6 @@ def get_web_ui():
             color: #bae6fd;
         }
 
-        /* Acciones Rapidas (Chips) */
-        .quick-actions {
-            display: flex;
-            gap: 8px;
-            overflow-x: auto;
-            padding: 8px 20px;
-            background: var(--surface);
-            border-top: 1px solid var(--surface-border);
-            flex-shrink: 0;
-            scrollbar-width: none;
-        }
-
-        .quick-actions::-webkit-scrollbar {
-            display: none;
-        }
-
-        .action-chip {
-            background: var(--surface-hover);
-            color: var(--text-secondary);
-            border: 1px solid var(--surface-border);
-            padding: 6px 12px;
-            border-radius: 4px;
-            font-size: 0.75rem;
-            white-space: nowrap;
-            cursor: pointer;
-            transition: all 0.15s ease;
-        }
-
-        .action-chip:hover {
-            color: var(--text-primary);
-            border-color: var(--primary);
-        }
-
         /* Pie de Pagina / Entrada de Texto */
         footer {
             background: var(--surface);
@@ -698,9 +665,6 @@ def get_web_ui():
                 font-size: 0.88rem;
                 padding: 10px 12px;
             }
-            .quick-actions {
-                padding: 6px 12px;
-            }
             footer {
                 padding: 10px 12px;
             }
@@ -741,13 +705,6 @@ def get_web_ui():
             <div class="message-author">Gimena</div>
             Hola. Soy Gimena, tu asistente de hogar. Puedes darme instrucciones de control o hacerme cualquier consulta.
         </div>
-    </div>
-
-    <div class="quick-actions">
-        <div class="action-chip" onclick="sendChip('Estado de dispositivos')">Estado de dispositivos</div>
-        <div class="action-chip" onclick="sendChip('Enciende la luz de la sala')">Encender luz de sala</div>
-        <div class="action-chip" onclick="sendChip('Apaga todos los dispositivos')">Apagar dispositivos</div>
-        <div class="action-chip" onclick="sendChip('¿Que dispositivos hay en la casa?')">Dispositivos detectados</div>
     </div>
 
     <footer>
@@ -843,11 +800,6 @@ def get_web_ui():
                     Conversacion reiniciada. ¿En que puedo ayudarte?
                 </div>
             `;
-        }
-
-        function sendChip(text) {
-            input.value = text;
-            sendMessage();
         }
 
         async function sendMessage() {
