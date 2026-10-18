@@ -9,8 +9,8 @@
 // ------------------------------------------------------------------------------
 // Configuración de Red WiFi y Backend / Gemini API
 // ------------------------------------------------------------------------------
-#define WIFI_SSID           "TU_RED_WIFI"
-#define WIFI_PASSWORD       "TU_PASSWORD_WIFI"
+#define WIFI_SSID           "A54"
+#define WIFI_PASSWORD       "12345678"
 
 // URL del servidor intermediario (Backend FastAPI de baja latencia) o Endpoint
 // Ejemplo: "http://192.168.1.100:8000" si está en la red local
