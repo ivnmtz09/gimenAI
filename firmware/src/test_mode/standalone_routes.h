@@ -16,6 +16,13 @@ void handleDevices() {
         d["name"] = names[i]; d["target"] = "esp32_hardware";
         d["pin"] = pins[i]; d["state"] = states[i];
     }
+    for (size_t i = 0; i < enchufesTuya(); i++) {   // copia en memoria; no consulta la nube aquí
+        const DispositivoTuya& t = enchufeTuya(i);
+        JsonObject d = doc["devices"][t.alias].to<JsonObject>();
+        d["name"] = t.nombre; d["target"] = "tuya";
+        d["state"] = t.encendido; d["online"] = t.enLinea;
+        if (t.potencia >= 0) d["power"] = t.potencia;
+    }
     doc["esp32_nodes"]["local"]["ip"] = WiFi.localIP().toString();
     doc["standalone"] = true;
     enviarJson(doc);
@@ -26,8 +33,22 @@ void handleToggle() {
     if (id == "luz_sala") estadoLuzSala = !estadoLuzSala;
     else if (id == "luz_cocina") estadoLuzCocina = !estadoLuzCocina;
     else if (id == "ventilador") estadoVentilador = !estadoVentilador;
+    else if (id.startsWith("tuya_")) {
+        bool actual = false, existe = false;
+        for (size_t i = 0; i < enchufesTuya(); i++)
+            if (enchufeTuya(i).alias == id) { actual = enchufeTuya(i).encendido; existe = true; }
+        String error;
+        if (!existe) { localServer.send(404, "application/json", "{\"error\":\"Enchufe desconocido\"}"); return; }
+        if (!tuyaComando(id, !actual, error)) {
+            JsonDocument e; e["error"] = error; enviarJson(e, 502); return;
+        }
+        for (size_t i = 0; i < enchufesTuya(); i++)
+            if (enchufeTuya(i).alias == id) iniciarAnimacion(animacionDeDispositivo(id, !actual, enchufeTuya(i).nombre));
+        localServer.send(200, "application/json", "{\"status\":\"ok\"}"); return;
+    }
     else { localServer.send(404, "application/json", "{\"error\":\"Salida desconocida\"}"); return; }
     actualizarHardware();
+    iniciarAnimacion(animacionDeDispositivo(id, id == "luz_sala" ? estadoLuzSala : id == "luz_cocina" ? estadoLuzCocina : estadoVentilador));
     localServer.send(200, "application/json", "{\"status\":\"ok\"}");
 }
 
@@ -41,7 +62,7 @@ void handleChat() {
         localServer.send(400, "application/json", "{\"error\":\"Escribe entre 1 y 500 caracteres\"}"); return;
     }
     bool vozWeb = body["voice"] == "browser";
-    if (btObjetivoValido || !encolarChat(message, vozWeb)) {
+    if (!encolarChat(message, vozWeb)) {
         localServer.send(409, "application/json", "{\"error\":\"Gimena esta ocupada; espera a que termine\"}"); return;
     }
     JsonDocument result; result["job"] = chatJob;
@@ -54,7 +75,7 @@ void handleChatStatus() {
     }
     JsonDocument doc;
     doc["busy"] = chatOcupado(); doc["reply"] = jobReply; doc["face"] = caraActual;
-    doc["error"] = jobError; doc["audio_error"] = voiceError;
+    doc["error"] = jobError; doc["audio_error"] = voiceError; doc["animation"] = jobAnimacion;
     enviarJson(doc);
 }
 
@@ -93,7 +114,7 @@ void hablarEnNavegador() {
     vozWebLlenos = 0;
     audioReproduciendo = true;   // la boca de la OLED se mueve mientras se genera la voz
     String error;
-    bool ok = geminiSpeech(jobReply, 24000, salidaVozWeb, error, 100);
+    bool ok = sintetizarVoz(jobReply, 24000, salidaVozWeb, error, 100);
     audioReproduciendo = false;
     atendiendoPeticionLarga = false;
     if (vozWebCabeceras) {

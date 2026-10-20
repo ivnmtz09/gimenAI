@@ -38,6 +38,23 @@
 #define GEMINI_TTS_VOICE     "Kore"
 
 // ------------------------------------------------------------------------------
+// Voz rápida: Google Cloud Text-to-Speech (clave de Google Cloud "AIza...", con la
+// API Text-to-Speech activada). Define GOOGLE_TTS_API_KEY en secrets.h; sin ella
+// se usa Gemini TTS, que es más lento.
+// ------------------------------------------------------------------------------
+#ifndef GOOGLE_TTS_API_KEY
+#define GOOGLE_TTS_API_KEY   ""
+#endif
+#ifndef GOOGLE_TTS_LANGUAGE
+#define GOOGLE_TTS_LANGUAGE  "es-US"
+#endif
+#ifndef GOOGLE_TTS_VOICE
+#define GOOGLE_TTS_VOICE     "es-US-Neural2-A"   // femenina, español latinoamericano
+#endif
+#define GOOGLE_TTS_RATE      16000   // µ-law 8 bit: ~21 KB/s en base64, por debajo del límite de la placa
+#define GOOGLE_TTS_SPEED     1.05
+
+// ------------------------------------------------------------------------------
 // Pantalla OLED GM009605v4.3 (Controlador SSD1306 I2C 128x64)
 // Pines I2C estándar del ESP32 DevKit V1
 // ------------------------------------------------------------------------------
@@ -67,10 +84,3 @@
 #define AUDIO_PIN_DIN        27   // MAX98357A DIN
 #define AUDIO_SAMPLE_RATE    16000  // salida I2S; Gemini TTS se remuestrea desde 24 kHz
 #define AUDIO_VOLUMEN        60   // 0-100 (si suena saturado o con ruido, bájalo)
-
-// ------------------------------------------------------------------------------
-// Bluetooth: el ESP32 busca parlantes/audífonos (A2DP) y les envía la voz de Gimena
-// ------------------------------------------------------------------------------
-// 1 = diagnóstico: el selector lista TODO dispositivo Bluetooth visible (teléfonos, PCs...)
-// 0 = solo dispositivos de audio y teléfonos (lo normal)
-#define BT_LISTAR_TODOS      0

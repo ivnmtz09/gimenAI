@@ -88,45 +88,26 @@ Al arrancar suenan dos notas cortas: si las oyes, el cableado del parlante es co
 El volumen se ajusta con `AUDIO_VOLUMEN` en `firmware/include/test_config.h`.
 
 **Flujo autónomo:** el ESP32 sirve el panel en el puerto 80 y llama directamente
-por HTTPS a Gemini para obtener la respuesta y las acciones GPIO. Después consulta
-Gemini TTS y decodifica el audio PCM de 24 kHz por bloques, sin almacenarlo completo
-en RAM. Remuestrea a 16 kHz para I2S o 44,1 kHz para A2DP. El PC puede estar apagado.
-Se valida el certificado TLS con el almacén de autoridades de confianza del SDK
-ESP32; la hora se sincroniza por NTP. Mantén actualizada la plataforma para
-actualizar ese almacén de certificados. La voz depende de la cuota de Gemini TTS de la cuenta.
+por HTTPS a Gemini para obtener la respuesta y las acciones GPIO. Después sintetiza
+la voz con Google Cloud TTS (si `GOOGLE_TTS_API_KEY` está definida; µ-law a 16 kHz)
+o con Gemini TTS (PCM de 24 kHz), y la decodifica por bloques sin almacenarla
+completa en RAM. Remuestrea a 16 kHz para I2S o la envía al navegador del panel.
+El PC puede estar apagado. Se valida el certificado TLS con el almacén de
+autoridades de confianza del SDK ESP32; la hora se sincroniza por NTP.
 
-### Selector Bluetooth del panel web
+La placa expone `/api/devices`, `/api/chat`, `/api/chat/status`, `/api/chat/voice`
+(audio de la última respuesta para el navegador), `/api/network/scan` (dispositivos
+IoT encontrados por SSDP y mDNS) y `/wifi` (cambio de red). El chat se acepta como
+trabajo (HTTP 202) y el panel consulta su estado; la clave API nunca se incluye en
+las respuestas HTTP ni en el HTML.
 
-En el entorno `esp32-test-devkit`, la voz también puede salir por un parlante o
-audífonos Bluetooth Classic con perfil A2DP, sin conectar el MAX98357A.
-El ESP32 realiza el escaneo y aloja el panel; el navegador se conecta directamente a la placa.
+**Enchufes Smart Life (Tuya):** con `TUYA_CLIENT_ID`, `TUYA_CLIENT_SECRET` y
+`TUYA_REGION` en `secrets.h` (proyecto de Tuya IoT Platform en el centro de datos
+Western America, con la cuenta de la app vinculada), Gimena descarga los dispositivos
+de la cuenta (`tuya_1`, `tuya_2`...), los muestra en el panel y los enciende o apaga
+por voz mediante la API en la nube de Tuya (`/v1.0/devices/{id}/commands`).
 
-1. Compila y carga el entorno `esp32-test-devkit` de `firmware/platformio.ini`.
-   La librería ESP32-A2DP se instala automáticamente. La partición `huge_app.csv`
-   deja espacio para WiFi, Bluetooth y el panel local; este entorno no usa OTA.
-2. Conecta el ESP32 y el celular o computador a la misma red WiFi. Abre
-   `http://<IP-del-ESP32>/` (la IP aparece en el monitor serie). No ejecutes Python.
-   Configura `firmware/include/secrets.h` (ignorado por Git) con `TEST_WIFI_SSID`,
-   `TEST_WIFI_PASSWORD` y `GEMINI_API_KEY`, definidos con `#define` y valores entre
-   comillas. Esta configuración tiene prioridad sobre `test_config.h`.
-3. Enciende el parlante y activa su modo de emparejamiento. En **Bluetooth** pulsa
-   **Buscar**: el selector se actualiza mientras el ESP32 escanea durante 45 segundos.
-4. Elige el nombre y dirección del dispositivo y pulsa **Conectar**. El panel muestra
-   el progreso y permite **Cancelar conexión**. La conexión puede tardar hasta 60 segundos.
-5. Cuando aparezca **Conectado**, escribe al asistente: su voz saldrá por el parlante.
-   Usa **Desconectar** antes de elegir otro. El ESP32 recuerda el último parlante
-   y trata de reconectarlo al arrancar; una desconexión voluntaria borra ese recuerdo.
-
-El selector muestra dispositivos de audio Bluetooth Classic detectables por el ESP32;
-no es una lista de sensores BLE ni de dispositivos detectados por el computador.
-Si no aparece un parlante, comprueba que no esté conectado a otro teléfono o PC y
-vuelve a activar el emparejamiento. Un error de firmware en el panel requiere
-volver a cargar `esp32-test-devkit`.
-
-El ESP32-S3 del entorno final solo admite Bluetooth LE, por lo que no puede usar
-A2DP directamente ([compatibilidad de Espressif](https://docs.espressif.com/projects/esp-adf/en/latest/solution-center/bluetooth-audio.html)).
-
-La placa expone `/api/devices`, `/api/chat`, `/api/chat/status` y
-`/api/bluetooth` con sus acciones de búsqueda, conexión y desconexión. El chat
-se acepta como trabajo (HTTP 202) y el panel consulta su estado; la clave API
-nunca se incluye en las respuestas HTTP ni en el HTML.
+**Animaciones de la OLED:** al encender o apagar algo se ve un bombillo, un enchufe
+o un ventilador; durante el escaneo de red, un radar. Gemini elige además `musica`,
+`corazones`, `fiesta`, `saludo` o `reloj` (con la hora real) según la conversación.
+Para verlas sin hablarle: `http://<IP>/cara?a=luz_on` (o cualquier otro nombre).

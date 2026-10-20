@@ -3,12 +3,15 @@
 // Escaneo de dispositivos IoT en la red local. Combina en paralelo:
 //   - SSDP/UPnP (TVs, Echo, Chromecast, routers, Hue...) + su descripción XML
 //   - mDNS/DNS-SD (Google Cast, HomeKit, ESPHome, impresoras, AirPlay...)
+//   - Tuya / Smart Life: difusiones UDP 6666 (v3.1, texto) y 6667 (v3.3, AES)
+//   - TP-Link Kasa: consulta de descubrimiento por UDP 9999
 // El resultado se guarda unos minutos para no repetir el escaneo en cada mensaje.
 // ------------------------------------------------------------------------------
 #include <WiFiUdp.h>
 #include <HTTPClient.h>
 #include <ESPmDNS.h>
 #include <mdns.h>
+#include <mbedtls/aes.h>
 
 struct DispositivoRed {
     IPAddress ip;
@@ -101,8 +104,116 @@ void leerDescripcionUpnp(DispositivoRed& d) {
     http.end();
 }
 
+// ---- Tuya / Smart Life ----
+// Los equipos Tuya no usan SSDP ni mDNS: difunden cada ~5 s una trama 0x000055AA con
+// JSON {ip, gwId, productKey, version}. En v3.3 va cifrado con AES-128-ECB y la clave
+// pública de descubrimiento md5("yGAdlopoPVldABfn").
+const uint8_t TUYA_CLAVE_UDP[16] = {0x6c, 0x1e, 0xc8, 0xe2, 0xbb, 0x9b, 0xb5, 0x9a,
+                                    0xb5, 0x0b, 0x0d, 0xaf, 0x64, 0x9b, 0x41, 0x0a};
+
+// Difunden a intervalos irregulares (3-11 s), así que se escuchan siempre en segundo
+// plano y el escaneo solo incorpora los vistos en los últimos minutos.
+struct TuyaVisto { IPAddress ip; char version[8]; unsigned long visto; };
+const int TUYA_MAX = 8;
+const unsigned long TUYA_VIGENCIA_MS = 5UL * 60UL * 1000UL;
+TuyaVisto tuyaVistos[TUYA_MAX];
+int tuyaCantidad = 0;
+WiFiUDP tuyaUdp31, tuyaUdp33;
+bool tuyaEscuchando = false;
+
+void registrarTuya(const char* json, size_t n, IPAddress origen) {
+    JsonDocument doc;
+    if (deserializeJson(doc, json, n)) return;
+    IPAddress ip;
+    if (!ip.fromString(doc["ip"] | "")) ip = origen;
+    int i = 0;
+    while (i < tuyaCantidad && tuyaVistos[i].ip != ip) i++;
+    if (i == tuyaCantidad) {
+        if (tuyaCantidad == TUYA_MAX) return;
+        tuyaCantidad++;
+        tuyaVistos[i].ip = ip;
+        Serial.printf("[Red] Tuya detectado en %s (v%s)\n", ip.toString().c_str(), doc["version"] | "?");
+    }
+    strlcpy(tuyaVistos[i].version, doc["version"] | "?", sizeof(tuyaVistos[i].version));
+    tuyaVistos[i].visto = millis();
+}
+
+void leerTuya(WiFiUDP& udp, bool cifrado) {
+    if (udp.parsePacket() <= 0) return;
+    static uint8_t trama[512];
+    int len = udp.read(trama, sizeof(trama));
+    if (len < 36 || trama[2] != 0x55 || trama[3] != 0xAA) return;
+    // prefijo(4) secuencia(4) comando(4) longitud(4) retorno(4) | carga | crc(4) sufijo(4)
+    uint8_t* carga = trama + 20;
+    size_t n = len - 28;
+    if (!cifrado) {
+        uint8_t* ini = (uint8_t*)memchr(carga, '{', n);
+        if (ini) registrarTuya((const char*)ini, n - (ini - carga), udp.remoteIP());
+        return;
+    }
+    n -= n % 16;
+    if (!n) return;
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_dec(&aes, TUYA_CLAVE_UDP, 128);
+    for (size_t i = 0; i < n; i += 16) mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_DECRYPT, carga + i, carga + i);
+    mbedtls_aes_free(&aes);
+    uint8_t relleno = carga[n - 1];   // PKCS#7
+    if (relleno >= 1 && relleno <= 16) n -= relleno;
+    registrarTuya((const char*)carga, n, udp.remoteIP());
+}
+
+void iniciarEscuchaTuya() {
+    tuyaEscuchando = tuyaUdp31.begin(6666);
+    tuyaUdp33.begin(6667);
+}
+
+// Se llama desde loop(): lee como mucho una trama por puerto en cada vuelta
+void atenderEscuchaTuya() {
+    if (!tuyaEscuchando) return;
+    leerTuya(tuyaUdp31, false);
+    leerTuya(tuyaUdp33, true);
+}
+
+void incorporarTuyaVistos() {
+    for (int i = 0; i < tuyaCantidad; i++) {
+        if (millis() - tuyaVistos[i].visto > TUYA_VIGENCIA_MS) continue;
+        DispositivoRed* d = redBuscarOCrear(tuyaVistos[i].ip);
+        if (!d) return;
+        d->nombre = "Dispositivo Tuya / Smart Life";
+        d->tipo = String("enchufe o equipo Tuya v") + tuyaVistos[i].version + ", control local por TCP 6668";
+        d->fabricante = "Tuya";
+    }
+}
+
+// ---- TP-Link Kasa: JSON con XOR encadenado (clave inicial 171) ----
+size_t kasaCifrar(const char* texto, uint8_t* salida) {
+    uint8_t clave = 171;
+    size_t n = strlen(texto);
+    for (size_t i = 0; i < n; i++) { clave ^= (uint8_t)texto[i]; salida[i] = clave; }
+    return n;
+}
+
+void leerKasa(WiFiUDP& udp) {
+    if (udp.parsePacket() <= 0) return;
+    static char texto[1024];
+    int len = udp.read((uint8_t*)texto, sizeof(texto) - 1);
+    if (len <= 0) return;
+    uint8_t clave = 171;
+    for (int i = 0; i < len; i++) { uint8_t c = (uint8_t)texto[i]; texto[i] = (char)(clave ^ c); clave = c; }
+    JsonDocument doc;
+    if (deserializeJson(doc, texto, len)) return;
+    JsonObject info = doc["system"]["get_sysinfo"];
+    if (info.isNull()) return;
+    DispositivoRed* d = redBuscarOCrear(udp.remoteIP());
+    if (!d) return;
+    d->nombre = String(info["alias"] | "Dispositivo Kasa").substring(0, 48);
+    d->tipo = String(info["model"] | (info["dev_name"] | "TP-Link Kasa")).substring(0, 48);
+    d->fabricante = "TP-Link Kasa";
+}
+
 void escanearRed() {
-    Serial.println("[Red] Escaneando dispositivos IoT (SSDP + mDNS)...");
+    Serial.println("[Red] Escaneando dispositivos IoT (SSDP + mDNS + Tuya + Kasa)...");
     unsigned long inicio = millis();
     redCantidad = 0;
 
@@ -112,9 +223,17 @@ void escanearRed() {
         busquedas[i] = mdns_query_async_new(nullptr, MDNS_SERVICIOS[i][0], MDNS_SERVICIOS[i][1],
                                             MDNS_TYPE_PTR, 2500, 8, nullptr);
 
-    // 2. SSDP mientras tanto
-    WiFiUDP udp;
-    if (udp.begin(41900)) {
+    // 2. Mientras tanto: SSDP y Kasa (Tuya se escucha siempre en segundo plano)
+    WiFiUDP udp, kasa;
+    bool ssdpOk = udp.begin(41900);
+    if (kasa.begin(41999)) {
+        static uint8_t consulta[64];
+        size_t n = kasaCifrar("{\"system\":{\"get_sysinfo\":{}}}", consulta);
+        kasa.beginPacket(WiFi.broadcastIP(), 9999);
+        kasa.write(consulta, n);
+        kasa.endPacket();
+    }
+    if (ssdpOk) {
         const char* msearch =
             "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: ssdp:all\r\n\r\n";
         for (int intento = 0; intento < 2; intento++) {   // UDP puede perderse: se envía dos veces
@@ -123,26 +242,30 @@ void escanearRed() {
             udp.endPacket();
             delay(50);
         }
-        unsigned long fin = millis() + 2800;
-        char paquete[700];
-        while (millis() < fin) {
-            int n = udp.parsePacket();
-            if (n > 0) {
-                int leidos = udp.read(paquete, sizeof(paquete) - 1);
-                paquete[max(leidos, 0)] = 0;
-                String respuesta = String("\n") + paquete;
-                DispositivoRed* d = redBuscarOCrear(udp.remoteIP());
-                if (d) {
-                    if (!d->descripcion.length()) d->descripcion = cabeceraSsdp(respuesta, "location");
-                    if (!d->tipo.length()) d->tipo = cabeceraSsdp(respuesta, "server").substring(0, 48);
-                }
-            } else {
-                serviceStandalone();
-                delay(5);
-            }
-        }
-        udp.stop();
     }
+    unsigned long fin = millis() + 3000;
+    char paquete[700];
+    while (millis() < fin) {
+        int n = ssdpOk ? udp.parsePacket() : 0;
+        if (n > 0) {
+            int leidos = udp.read(paquete, sizeof(paquete) - 1);
+            paquete[max(leidos, 0)] = 0;
+            String respuesta = String("\n") + paquete;
+            DispositivoRed* d = redBuscarOCrear(udp.remoteIP());
+            if (d) {
+                if (!d->descripcion.length()) d->descripcion = cabeceraSsdp(respuesta, "location");
+                if (!d->tipo.length()) d->tipo = cabeceraSsdp(respuesta, "server").substring(0, 48);
+            }
+            continue;
+        }
+        atenderEscuchaTuya();
+        leerKasa(kasa);
+        serviceStandalone();
+        delay(5);
+    }
+    udp.stop();
+    kasa.stop();
+    incorporarTuyaVistos();
 
     // 3. Recoger resultados mDNS
     for (int i = 0; i < MDNS_CANTIDAD; i++) {

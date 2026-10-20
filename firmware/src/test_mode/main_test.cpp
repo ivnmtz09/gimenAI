@@ -9,11 +9,10 @@
 #include <uri/UriBraces.h>
 #include <time.h>
 #include "standalone_cloud.h"
+#include "tuya_cloud.h"
 #include "web_panel.h"
 #include <driver/i2s.h>
-#include <BluetoothA2DPSource.h>
 #include <Preferences.h>
-#include <freertos/stream_buffer.h>
 #include <math.h>
 
 #include "test_config.h"
@@ -208,6 +207,8 @@ void dibujarCara(const String& cara, bool parpadeo) {
     }
 }
 
+#include "oled_animaciones.h"
+
 bool portalWiFiActivo = false;   // sin red: la OLED muestra el QR del portal WiFi
 void dibujarPantallaSinWiFi();
 
@@ -218,6 +219,12 @@ void dibujarPantalla() {
         display.display();
         return;
     }
+    if (animacionActiva()) {
+        dibujarAnimacion();
+        display.display();
+        return;
+    }
+    invertirPantalla(false);
     dibujarCara(oledCara, oledParpadeo);
 
     // Único indicador: circulito vacío arriba a la izquierda si no hay WiFi
@@ -230,6 +237,7 @@ void dibujarPantalla() {
 // (El texto ya no se dibuja: solo se usa para estimar cuánto dura el habla.)
 void renderOLED(const String& cara, const String& mensaje, bool hablar = false) {
     oledCara = cara;
+    detenerAnimacion();
     oledParpadeo = false;
     oledBocaAbierta = false;
     oledProxParpadeo = millis() + 2500;
@@ -243,6 +251,12 @@ void actualizarPantalla() {
     if (portalWiFiActivo) return;   // QR fijo: no redibujar mientras se escanea
     unsigned long ahora = millis();
     bool redibujar = false;
+
+    if (oledAnim.length()) {                     // animación de pantalla completa (~15 cuadros/s)
+        if (!animacionActiva()) { detenerAnimacion(); dibujarPantalla(); return; }
+        if (ahora - oledUltimoFrame >= 66) { oledUltimoFrame = ahora; dibujarPantalla(); }
+        return;
+    }
 
     bool pestanea = (oledCara == "neutral" || oledCara == "sad" || oledCara == "thinking");
     if (pestanea) {
@@ -291,273 +305,6 @@ void actualizarHardware() {
 }
 
 // ------------------------------------------------------------------------------
-// Bluetooth A2DP: el ESP32 busca parlantes cercanos y les envía la voz de Gimena.
-//   - El panel web lista lo que encuentra el ESP32 y pide conectar a uno.
-//   - El audio llega por un StreamBuffer (PCM mono 44,1 kHz) y la librería lo
-//     codifica (SBC) y lo transmite.
-// ------------------------------------------------------------------------------
-const int BT_MAX_DISPOSITIVOS = 12;
-const unsigned long BT_VENTANA_BUSQUEDA_MS = 45000;   // cuánto busca tras pulsar "Buscar"
-const unsigned long BT_VENTANA_CONEXION_MS = 60000;   // cuánto intenta encontrar el parlante elegido
-
-struct BtDispositivo {
-    char nombre[36];
-    uint8_t mac[6];
-    int rssi;
-    unsigned long visto;
-};
-
-// La versión compatible con Arduino 2.x repite el escaneo automáticamente.
-// Controlamos su parada para respetar el límite de búsqueda y la cancelación.
-class BluetoothSelectorSource : public BluetoothA2DPSource {
-public:
-    void reanudarBusqueda() {
-        busquedaHabilitada = true;
-        is_target_status_active = true;
-        if (!is_discovery_active()) {
-            esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
-        }
-    }
-
-    void cancel_discovery() {
-        busquedaHabilitada = false;
-        is_target_status_active = false;
-        esp_bt_gap_cancel_discovery();
-    }
-
-protected:
-    bool busquedaHabilitada = true;
-
-    void app_gap_callback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t* param) override {
-        if (event == ESP_BT_GAP_DISC_STATE_CHANGED_EVT &&
-            param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED && !busquedaHabilitada) {
-            discovery_active = false;
-            if (s_a2d_state == APP_AV_STATE_DISCOVERED) s_a2d_state = APP_AV_STATE_UNCONNECTED;
-            if (discovery_mode_callback) discovery_mode_callback(ESP_BT_GAP_DISCOVERY_STOPPED);
-            return;
-        }
-        BluetoothA2DPSource::app_gap_callback(event, param);
-    }
-};
-
-BluetoothSelectorSource a2dp;
-Preferences btPrefs;
-BtDispositivo btLista[BT_MAX_DISPOSITIVOS];
-int btCantidad = 0;
-bool btIniciado = false;
-volatile bool btEscaneando = false;
-volatile bool btObjetivoValido = false;
-volatile bool btObjetivoEncontrado = false;
-uint8_t btObjetivo[6];
-char btObjetivoNombre[36] = "";
-char btNombreConectado[36] = "";
-uint8_t btMacConectado[6] = {0};
-String btError = "";
-unsigned long btEscaneoDesde = 0;
-unsigned long btVentanaMs = BT_VENTANA_BUSQUEDA_MS;
-StreamBufferHandle_t btStream = nullptr;
-SemaphoreHandle_t btMutex = nullptr;
-volatile bool usandoBT = false;         // la voz actual sale por Bluetooth (no por el MAX98357A)
-
-// Definidas en la sección de voz: el I2S se apaga mientras haya un parlante Bluetooth (libera RAM)
-void liberarI2S();
-void restaurarI2S();
-
-String macATexto(const uint8_t* m) {
-    char b[18];
-    snprintf(b, sizeof(b), "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
-    return String(b);
-}
-
-bool textoAMac(const String& t, uint8_t* m) {
-    if (t.length() != 17) return false;
-    for (int i = 0; i < 17; i++) {
-        if (i % 3 == 2 ? t[i] != ':' : !isxdigit((unsigned char)t[i])) return false;
-    }
-    unsigned int v[6];
-    if (sscanf(t.c_str(), "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) return false;
-    for (int i = 0; i < 6; i++) m[i] = (uint8_t)v[i];
-    return true;
-}
-
-bool btConectado() {
-    return btIniciado && a2dp.is_connected();
-}
-
-// La librería llama aquí por cada parlante/audífono detectado. Devolver true = conectar a ese.
-bool btAlEncontrar(const char* nombre, esp_bd_addr_t dir, int rssi) {
-    xSemaphoreTake(btMutex, portMAX_DELAY);
-    int idx = -1;
-    for (int i = 0; i < btCantidad; i++) {
-        if (memcmp(btLista[i].mac, dir, 6) == 0) { idx = i; break; }
-    }
-    if (idx < 0) {
-        if (btCantidad < BT_MAX_DISPOSITIVOS) {
-            idx = btCantidad++;
-        } else {   // lista llena: reemplazar el menos reciente
-            idx = 0;
-            for (int i = 1; i < btCantidad; i++) if (btLista[i].visto < btLista[idx].visto) idx = i;
-        }
-    }
-    strlcpy(btLista[idx].nombre, nombre ? nombre : "", sizeof(btLista[idx].nombre));
-    memcpy(btLista[idx].mac, dir, 6);
-    btLista[idx].rssi = rssi;
-    btLista[idx].visto = millis();
-
-    bool esObjetivo = btObjetivoValido && memcmp(dir, btObjetivo, 6) == 0;
-    if (esObjetivo) {
-        strlcpy(btNombreConectado, nombre && nombre[0] ? nombre : btObjetivoNombre, sizeof(btNombreConectado));
-        memcpy(btMacConectado, dir, 6);
-        btObjetivoEncontrado = true;
-    }
-    xSemaphoreGive(btMutex);
-    return esObjetivo;
-}
-
-// La librería pide muestras estéreo; el audio de la cola es mono y se duplica en ambos canales.
-int32_t btDatos(Frame* frames, int32_t cuenta) {
-    static int16_t mono[256];
-    int32_t hecho = 0;
-    bool hayDatos = true;
-    while (hecho < cuenta) {
-        int32_t n = min<int32_t>(256, cuenta - hecho);
-        int32_t leidas = 0;
-        if (hayDatos && btStream) {
-            leidas = xStreamBufferReceive(btStream, mono, n * sizeof(int16_t), 0) / sizeof(int16_t);
-        }
-        for (int32_t i = 0; i < leidas; i++) {
-            frames[hecho + i].channel1 = mono[i];
-            frames[hecho + i].channel2 = mono[i];
-        }
-        for (int32_t i = leidas; i < n; i++) {   // sin datos: silencio
-            frames[hecho + i].channel1 = 0;
-            frames[hecho + i].channel2 = 0;
-        }
-        if (leidas < n) hayDatos = false;
-        hecho += n;
-    }
-    return cuenta;
-}
-
-void btCambioEstado(esp_a2d_connection_state_t estado, void*) {
-    if (estado == ESP_A2D_CONNECTION_STATE_CONNECTED) {
-        btEscaneando = false;
-        btObjetivoValido = false;
-        btError = "";
-        if (!btStream) btStream = xStreamBufferCreate(8192, 1);   // cola de audio (solo si llega a conectar)
-        liberarI2S();
-        btPrefs.begin("bt", false);   // recordar el parlante para reconectar al arrancar
-        btPrefs.putString("addr", macATexto(btMacConectado));
-        btPrefs.putString("name", btNombreConectado);
-        btPrefs.end();
-        Serial.printf("[Bluetooth] Conectado a %s (%s)\n", btNombreConectado, macATexto(btMacConectado).c_str());
-    } else if (estado == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
-        if (btObjetivoValido) {   // se intentaba conectar y el parlante no aceptó
-            btError = String("No se pudo conectar a ") + btObjetivoNombre;
-            btObjetivoValido = false;
-            btEscaneando = false;
-        }
-        restaurarI2S();
-        Serial.println("[Bluetooth] Desconectado");
-    }
-}
-
-void btDescubrimiento(esp_bt_gap_discovery_state_t estado) {
-    Serial.printf("[Bluetooth] Búsqueda %s (dispositivos vistos: %d)\n",
-                  estado == ESP_BT_GAP_DISCOVERY_STARTED ? "iniciada" : "terminada", btCantidad);
-}
-
-void iniciarBT() {
-    if (btIniciado) return;
-    btMutex = xSemaphoreCreateMutex();
-    uint32_t libreAntes = ESP.getFreeHeap();
-    a2dp.set_reset_ble(true);              // libera la memoria de BLE (no se usa): ahorra RAM valiosa
-#if BT_LISTAR_TODOS
-    a2dp.set_valid_cod_service(0xFFFF);    // diagnóstico: listar cualquier dispositivo visible, no solo audio
-#endif
-    a2dp.set_auto_reconnect(false);
-    a2dp.set_ssp_enabled(true);            // emparejamiento sin PIN (parlantes modernos)
-    a2dp.set_local_name("Gimena");
-    a2dp.set_ssid_callback(btAlEncontrar);
-    a2dp.set_data_callback_in_frames(btDatos);
-    a2dp.set_on_connection_state_changed(btCambioEstado);
-    a2dp.set_discovery_mode_callback(btDescubrimiento);
-    a2dp.start();
-    btIniciado = true;
-    Serial.printf("[Bluetooth] A2DP iniciado. Memoria libre: %u -> %u bytes\n", libreAntes, ESP.getFreeHeap());
-}
-
-void btReanudarBusqueda() {
-    btEscaneando = true;
-    btEscaneoDesde = millis();
-    a2dp.reanudarBusqueda();
-}
-
-void btBuscar() {
-    if (btConectado()) return;
-    iniciarBT();
-    xSemaphoreTake(btMutex, portMAX_DELAY);
-    btCantidad = 0;
-    xSemaphoreGive(btMutex);
-    btError = "";
-    btObjetivoValido = false;
-    btObjetivoEncontrado = false;
-    btVentanaMs = BT_VENTANA_BUSQUEDA_MS;
-    btReanudarBusqueda();
-}
-
-void btSolicitarConexion(const uint8_t* mac, const char* nombre) {
-    iniciarBT();
-    memcpy(btObjetivo, mac, 6);
-    strlcpy(btObjetivoNombre, nombre, sizeof(btObjetivoNombre));
-    btObjetivoEncontrado = false;
-    btObjetivoValido = true;
-    btError = "";
-    btVentanaMs = BT_VENTANA_CONEXION_MS;
-    btReanudarBusqueda();
-    Serial.printf("[Bluetooth] Buscando '%s' (%s) para conectar...\n", nombre, macATexto(mac).c_str());
-}
-
-void btDesconectar() {
-    btObjetivoValido = false;
-    btObjetivoEncontrado = false;
-    btEscaneando = false;
-    btError = "";
-    if (btIniciado) a2dp.cancel_discovery();
-    if (btIniciado && a2dp.get_connection_state() != ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
-        a2dp.disconnect();
-    }
-    btNombreConectado[0] = 0;
-    btPrefs.begin("bt", false);   // desconexión voluntaria: no reconectar sola al arrancar
-    btPrefs.remove("addr");
-    btPrefs.remove("name");
-    btPrefs.end();
-}
-
-// Detiene la búsqueda cuando se acaba la ventana para no cargar la radio (comparte antena con el WiFi)
-void btSupervisar() {
-    if (!btIniciado || !btEscaneando || btConectado()) return;
-    if (millis() - btEscaneoDesde < btVentanaMs) return;
-    // Desactivar primero: el callback de fin no debe iniciar otra búsqueda.
-    btEscaneando = false;
-    a2dp.cancel_discovery();
-    if (btObjetivoValido) {
-        btError = String("No se encontró ") + btObjetivoNombre + ". Enciéndelo y ponlo en modo emparejamiento.";
-        btObjetivoValido = false;
-    }
-}
-
-// Al arrancar, reconecta con el último parlante usado
-void btRestaurarUltimo() {
-    btPrefs.begin("bt", true);
-    String addr = btPrefs.getString("addr", "");
-    String nombre = btPrefs.getString("name", "");
-    btPrefs.end();
-    uint8_t mac[6];
-    if (addr.length() > 0 && textoAMac(addr, mac)) btSolicitarConexion(mac, nombre.c_str());
-}
-
-// ------------------------------------------------------------------------------
 // Voz: descarga el WAV (16 kHz, mono, 16 bit) del servidor y lo reproduce por I2S
 //   Corre en una tarea aparte (núcleo 0) para que la cara y el servidor web
 //   del ESP32 sigan animándose sin cortar el audio.
@@ -595,7 +342,7 @@ void liberarI2S() {
     if (!audioListo || audioReproduciendo) return;
     i2s_driver_uninstall(I2S_NUM_0);
     audioListo = false;
-    Serial.printf("[Audio] I2S apagado (Bluetooth activo). Memoria libre: %u\n", ESP.getFreeHeap());
+    Serial.printf("[Audio] I2S apagado (libera RAM para TLS). Memoria libre: %u\n", ESP.getFreeHeap());
 }
 
 void restaurarI2S() {
@@ -634,16 +381,9 @@ void silencioI2S(int muestras) {
     }
 }
 
-// Envía PCM al parlante Bluetooth (si está conectado) o al amplificador I2S
+// Envía PCM al amplificador I2S
 void salidaAudio(const uint8_t* datos, int n) {
-    if (usandoBT) {
-        int enviado = 0;
-        while (enviado < n && btConectado()) {
-            enviado += xStreamBufferSend(btStream, datos + enviado, n - enviado, pdMS_TO_TICKS(100));
-        }
-    } else {
-        escribirI2S(datos, n);
-    }
+    escribirI2S(datos, n);
 }
 
 #include "network_scan.h"
@@ -676,109 +416,29 @@ void handleApiDevice() {
     localServer.send(400, "application/json", "{\"status\":\"error\"}");
 }
 
-// ---- API Bluetooth (la usa el panel web del servidor) ----
 void enviarJson(JsonDocument& doc, int codigo = 200) {
     String out;
     serializeJson(doc, out);
     localServer.send(codigo, "application/json", out);
 }
 
-void handleBtEstado() {
-    JsonDocument doc;
-    bool conectado = btConectado();
-    doc["esp32"] = true;
-    doc["activo"] = btIniciado;
-    doc["escaneando"] = (bool)btEscaneando;
-    doc["conectado"] = conectado;
-    doc["objetivo"] = btObjetivoValido ? btObjetivoNombre : "";
-    doc["nombre"] = conectado ? btNombreConectado : "";
-    doc["direccion"] = conectado ? macATexto(btMacConectado) : String("");
-    doc["error"] = btError;
-    doc["memoria"] = ESP.getFreeHeap();
-
-    JsonArray arr = doc["dispositivos"].to<JsonArray>();
-    bool conectadoEnLista = false;
-    if (btMutex) xSemaphoreTake(btMutex, portMAX_DELAY);
-    unsigned long ahora = millis();
-    for (int i = 0; i < btCantidad; i++) {
-        bool esConectado = conectado && memcmp(btLista[i].mac, btMacConectado, 6) == 0;
-        if (!esConectado && ahora - btLista[i].visto > 60000) continue;   // ya no se ve
-        JsonObject o = arr.add<JsonObject>();
-        o["nombre"] = btLista[i].nombre;
-        o["direccion"] = macATexto(btLista[i].mac);
-        o["rssi"] = btLista[i].rssi;
-        o["conectado"] = esConectado;
-        conectadoEnLista = conectadoEnLista || esConectado;
-    }
-    if (btMutex) xSemaphoreGive(btMutex);
-    if (conectado && !conectadoEnLista) {   // conectado de antes (p. ej. tras reiniciar): mostrarlo igual
-        JsonObject o = arr.add<JsonObject>();
-        o["nombre"] = btNombreConectado;
-        o["direccion"] = macATexto(btMacConectado);
-        o["rssi"] = 0;
-        o["conectado"] = true;
-    }
-    enviarJson(doc);
-}
-
-void handleBtBuscar() {
-    if (chatOcupado()) {
-        localServer.send(409, "application/json", "{\"error\":\"Espera a que Gimena termine de responder\"}");
-        return;
-    }
-    btBuscar();
-    handleBtEstado();
-}
-
-void handleBtConectar() {
-    if (chatOcupado()) {
-        localServer.send(409, "application/json", "{\"error\":\"Espera a que Gimena termine de responder\"}");
-        return;
-    }
-    if (btConectado() || btObjetivoValido) {
-        JsonDocument err;
-        err["error"] = "Desconecta o cancela la conexion actual antes de elegir otro dispositivo";
-        enviarJson(err, 409);
-        return;
-    }
-    JsonDocument body;
-    uint8_t mac[6];
-    if (!localServer.hasArg("plain") || deserializeJson(body, localServer.arg("plain")) ||
-        !textoAMac(String(body["address"] | ""), mac)) {
-        JsonDocument err;
-        err["error"] = "Direccion invalida";
-        enviarJson(err, 400);
-        return;
-    }
-    // Nombre: el que se vio en la búsqueda
-    char nombre[36];
-    strlcpy(nombre, macATexto(mac).c_str(), sizeof(nombre));
-    if (btMutex) xSemaphoreTake(btMutex, portMAX_DELAY);
-    for (int i = 0; i < btCantidad; i++) {
-        if (memcmp(btLista[i].mac, mac, 6) == 0 && btLista[i].nombre[0]) {
-            strlcpy(nombre, btLista[i].nombre, sizeof(nombre));
-            break;
-        }
-    }
-    if (btMutex) xSemaphoreGive(btMutex);
-    btSolicitarConexion(mac, nombre);
-    handleBtEstado();
-}
-
-void handleBtDesconectar() {
-    if (chatOcupado()) {
-        localServer.send(409, "application/json", "{\"error\":\"Espera a que Gimena termine de responder\"}");
-        return;
-    }
-    btDesconectar();
-    handleBtEstado();
-}
-
 #include "standalone_routes.h"
 #include "wifi_setup.h"
 
 // Vista previa de una cara: http://<ip-del-esp32>/cara?c=happy|neutral|thinking|surprised|sad
+// Animación: http://<ip-del-esp32>/cara?a=luz_on|luz_off|enchufe_on|enchufe_off|ventilador_on|ventilador_off|radar|musica|corazones|fiesta|saludo|reloj
 void handleCara() {
+    if (localServer.hasArg("buffer")) {   // copia del búfer de la OLED (1024 bytes, formato SSD1306 por páginas)
+        localServer.send_P(200, "application/octet-stream", (const char*)display.getBuffer(), SCREEN_WIDTH * SCREEN_HEIGHT / 8);
+        return;
+    }
+    if (localServer.hasArg("a")) {
+        String a = localServer.arg("a");
+        if (!animacionValida(a)) { localServer.send(400, "text/plain", "animacion desconocida"); return; }
+        iniciarAnimacion(a);
+        localServer.send(200, "text/plain", "ok " + a);
+        return;
+    }
     String c = localServer.hasArg("c") ? localServer.arg("c") : "neutral";
     caraActual = c;
     renderOLED(c, "Cara: " + c);
@@ -848,14 +508,6 @@ void setup() {
         localServer.on("/api/chat/history", HTTP_DELETE, handleClearHistory);
         localServer.on("/api/network/check", HTTP_POST, handleNetworkCheck);
         localServer.on("/api/network/scan", HTTP_GET, handleNetworkScan);
-        localServer.on("/api/bluetooth", HTTP_GET, handleBtEstado);
-        localServer.on("/api/bluetooth/scan", HTTP_POST, handleBtBuscar);
-        localServer.on("/api/bluetooth/connect", HTTP_POST, handleBtConectar);
-        localServer.on("/api/bluetooth/disconnect", HTTP_POST, handleBtDesconectar);
-        localServer.on("/api/bt", HTTP_GET, handleBtEstado);
-        localServer.on("/api/bt/scan", HTTP_POST, handleBtBuscar);
-        localServer.on("/api/bt/connect", HTTP_POST, handleBtConectar);
-        localServer.on("/api/bt/disconnect", HTTP_POST, handleBtDesconectar);
         // Cambiar de red sin recompilar: http://<IP>/wifi
         localServer.on("/wifi", handlePortalPagina);
         localServer.on("/api/wifi/scan", HTTP_GET, handleWifiEscaneo);
@@ -865,11 +517,11 @@ void setup() {
         configTime(0, 0, "time.google.com", "pool.ntp.org");
         MDNS.begin("gimena");   // necesario para el escaneo mDNS; además publica http://gimena.local/
         MDNS.addService("http", "tcp", 80);
+        WiFi.setSleep(false);   // sin ahorro de energía el ESP32 no pierde difusiones (Tuya, SSDP)
+        iniciarEscuchaTuya();
         Serial.printf("[Autonomo] Abre http://%s/ en tu celular o computador.\n", WiFi.localIP().toString().c_str());
         renderOLED("happy", ultimaRespuesta, true);
 
-        // Restaurar el parlante recordado.
-        btRestaurarUltimo();
     } else {
         Serial.printf("Fallo al conectar WiFi (status=%d). Abriendo portal de configuración.\n", (int)WiFi.status());
         ultimaRespuesta = "Sin WiFi. Escanea el QR para conectarme.";
@@ -891,8 +543,16 @@ void setup() {
 void loop() {
     localServer.handleClient();
     atenderPortalWiFi();
+    atenderEscuchaTuya();
     actualizarPantalla();
-    btSupervisar();
+
+    // Primera lectura de los enchufes Tuya en cuanto hay hora de internet (firma de la API).
+    static bool tuyaPrecargado = false;
+    if (!tuyaPrecargado && !portalWiFiActivo && tuyaConfigurado() && time(nullptr) > 1700000000 && !chatPending) {
+        tuyaPrecargado = true;
+        String error;
+        if (!tuyaActualizar(error, 0)) Serial.printf("[Tuya] %s\n", error.c_str());
+    }
 
     if (chatPending) {
         chatPending = false;
@@ -901,6 +561,16 @@ void loop() {
         consultarGimena(message);
     }
     if (voicePending && (int32_t)(millis() - voiceReadyAt) >= 0) hablarDirectamente();
+    else if (!chatOcupado() && !portalWiFiActivo && WiFi.status() == WL_CONNECTED && !animacionActiva()) {
+        // En reposo: lista de enchufes al día (cada 3 min) y conexiones HTTPS listas.
+        static unsigned long ultimoTuya = 0;
+        if (tuyaConfigurado() && time(nullptr) > 1700000000 && millis() - ultimoTuya > 180000) {
+            ultimoTuya = millis();
+            String error;
+            if (!tuyaActualizar(error, 170000)) Serial.printf("[Tuya] %s\n", error.c_str());
+        }
+        precalentarConexiones();
+    }
 
     // Leer entrada del Monitor Serial USB
     while (Serial.available() > 0) {
